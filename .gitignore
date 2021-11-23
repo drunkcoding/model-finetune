@@ -1,3 +1,10 @@
+# checkpoints
+outputs/
+log/
+TestResult/
+figures/
+wandb/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
