@@ -59,9 +59,9 @@ set -e
 
 task_name=$1
 model_name=$2
+learning_rate=$3
 batch_size=8
 base_dir=$4
-learning_rate=$3
 
 mkdir -p ./outputs/${model_name}/${task_name}/
 mkdir -p ./log/${model_name}/${task_name}/

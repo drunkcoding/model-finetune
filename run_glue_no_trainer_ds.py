@@ -187,8 +187,8 @@ def main():
 
     mpu.get_model_parallel_world_size = lambda: torch.cuda.device_count()
     mpu.get_model_parallel_rank = lambda: args.local_rank
-    deepspeed.init_distributed()
-    mpu.initialize_model_parallel(torch.cuda.device_count())
+    # deepspeed.init_distributed()
+    mpu.initialize_model_parallel(2, torch.cuda.device_count() // 2)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # accelerator = Accelerator()
@@ -442,13 +442,15 @@ def main():
                 break
 
         model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-            metric.add_batch(
-                predictions=predictions,
-                references=batch["labels"],
-            )
+        with torch.no_grad():
+            for step, batch in enumerate(eval_dataloader):
+                batch = BatchEncoding(batch).to(torch.cuda.current_device())
+                outputs = model(**batch)
+                predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+                metric.add_batch(
+                    predictions=predictions,
+                    references=batch["labels"],
+                )
 
         eval_metric = metric.compute()
         logger.info(f"epoch {epoch}: {eval_metric}")
@@ -467,13 +469,15 @@ def main():
         # eval_dataloader = accelerator.prepare(eval_dataloader)
 
         model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            metric.add_batch(
-                predictions=predictions,
-                references=batch["labels"],
-            )
+        with torch.no_grad():
+            for step, batch in enumerate(eval_dataloader):
+                batch = BatchEncoding(batch).to(torch.cuda.current_device())
+                outputs = model(**batch)
+                predictions = outputs.logits.argmax(dim=-1)
+                metric.add_batch(
+                    predictions=predictions,
+                    references=batch["labels"],
+                )
 
         eval_metric = metric.compute()
         logger.info(f"mnli-mm: {eval_metric}")
