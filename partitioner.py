@@ -77,24 +77,24 @@ def split_outputs(out_tensor):
 
 class DummyModule(nn.Module):
 
-    # device = torch.cuda.current_device()
+    device = "cpu"
 
     def __init__(self, config) -> None:
         super().__init__()
         self.config = config
         self.embed_dim = get_embed_dim(config)
 
-    # def to(self, device):
-    #     self.device = device
-    #     return super().to(device)
+    def to(self, device):
+        self.device = device
+        return super().to(device)
 
 def move_data(outputs, device):
     if outputs[0].device == device: return outputs
     outputs = list(outputs)
     # print(outputs)
-    for i in range(1, len(outputs)):
-        if type(outputs[i]) is torch.Tensor:
-            outputs[i] = outputs[i].to(device)
+    for i in range(len(outputs)):
+        # if type(outputs[i]) is torch.Tensor:
+        outputs[i] = outputs[i].to(device)
     outputs = tuple(outputs)
     return outputs
 
@@ -102,8 +102,10 @@ class GPTEmbedding(DummyModule):
     def __init__(self, config, model=None):
         super().__init__(config)
 
+        self.config = config
+
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        if hasattr(config, 'max_position_embeddings'):
+        if config.model_type != "gptj":
             print("max_position_embeddings")
             self.wpe = nn.Embedding(
                 config.max_position_embeddings, self.embed_dim)
@@ -112,6 +114,13 @@ class GPTEmbedding(DummyModule):
         if model:
             print("GPTEmbedding copy_weights")
             self.copy_weights(model)
+
+    def to(self, device):
+        self.device = device
+        self.wte = self.wte.to(device)
+        if hasattr(self, 'wpe'):
+            self.wpe = self.wpe.to(device)
+        return self
 
     def copy_weights(self, model):
         # super().__init__()
@@ -191,6 +200,8 @@ class GPTEmbedding(DummyModule):
         # if inputs_embeds is None:
         inputs_embeds = self.wte(input_ids)
 
+        hidden_states = inputs_embeds
+
         if hasattr(self, 'wpe'):
             position_embeds = self.wpe(position_ids)
             hidden_states = inputs_embeds + position_embeds
@@ -201,14 +212,14 @@ class GPTEmbedding(DummyModule):
 
         hidden_states = self.drop(hidden_states)
 
-        head_mask = [None] * get_num_layers(self.config)
+        # head_mask = [None] * get_num_layers(self.config)
 
         # attention_mask.require_grad = True
         # attention_mask.grad_fn = hidden_states.grad_fn
         # print(hidden_states.shape, attention_mask.shape, attention_mask.dtype)
         # cat_outputs = torch.concat([torch.squeeze(attn_mask).unsqueeze(0).transpose(-2,-1), hidden_states.transpose(0,-1)])
         # print(input_ids, attention_mask, head_mask)
-        return hidden_states, input_ids, attention_mask, head_mask
+        return hidden_states, input_ids, attention_mask# , head_mask
         # return concat_outputs(hidden_states, attention_mask)
 
     # def forward(
@@ -309,7 +320,7 @@ class GPTBlock(DummyModule):
         # print(config)
 
         if config.model_type == "gptj":
-            self.block = GPTJBlock(config, layer_idx)
+            self.block = GPTJBlock(config)
         elif config.model_type == "gpt2":
             self.block = GPT2Block(config, layer_idx)
         elif config.model_type == "gpt_neo":
@@ -322,8 +333,13 @@ class GPTBlock(DummyModule):
             print(f"GPTBlock copy_weights {layer_idx}")
             self.copy_weights(model, layer_idx)
 
+    def to(self, device):
+        self.device = device
+        self.block = self.block.to(device)
+        return self
+
     def forward(self, args):
-        hidden_states, input_ids, attention_mask, head_mask = args
+        hidden_states, input_ids, attention_mask = args
         # hidden_states = hidden_states.to(self.device)
         # input_ids = input_ids.to(self.device)
         # attention_mask = attention_mask.to(self.device)
@@ -336,12 +352,12 @@ class GPTBlock(DummyModule):
         outputs = self.block(
             hidden_states,
             attention_mask=attention_mask,
-            head_mask=head_mask[self.layer_idx],
+            # head_mask=head_mask[self.layer_idx],
         )
         # print(self.layer_idx, outputs[0])
         # attention_mask.require_grad = True
         # print(input_ids, attention_mask, head_mask)
-        return outputs[0], input_ids, attention_mask, head_mask
+        return outputs[0], input_ids, attention_mask#, head_mask
         # if self.layer_idx == 11: exit()
         # return concat_outputs(outputs[0], attn_mask)
 
@@ -374,11 +390,18 @@ class GPTOutput(DummyModule):
             self.score = nn.Linear(self.embed_dim, self.num_labels, bias=False)
 
         if model:
+            
             print("GPTOutput copy_weights")
             self.copy_weights(model)
 
+    def to(self, device):
+        self.device = device
+        self.ln_f = self.ln_f.to(device)
+        self.score = self.score.to(device)
+        return self
+
     def forward(self, args):
-        hidden_states, input_ids, attention_mask, _ = args
+        hidden_states, input_ids, attention_mask = args
         # hidden_states = hidden_states.to(self.device)
         # input_ids = input_ids.to(self.device)
         # attention_mask = attention_mask.to(self.device)
@@ -444,8 +467,8 @@ class GPTModelPipe(nn.Module):
 
         self.model_parallel = False
 
-        self.first_device = "cuda:0"
-        self.last_device = "cuda:0"
+        self.first_device = "cpu"
+        self.last_device = "cpu"
         # self.device = "cuda:0"
 
     def copy_weights(self, model):
@@ -458,6 +481,14 @@ class GPTModelPipe(nn.Module):
         self.out.copy_weights(model)
 
         return self
+
+    def to(self, device):
+        self.embed.device  = device
+        for idx in range(len(self.h)):
+            self.h[idx].device  = device
+        self.out.device = device
+
+        return super().to(device)
 
     def to_layers(self):
         # for h in self.h:
@@ -502,21 +533,21 @@ class GPTModelPipe(nn.Module):
     def forward(self, args, output_hidden_states=False):
         all_hidden_states = ()
         outputs = self.embed(args)
-        # print(outputs[0].device, self.model_parallel)
+        print(outputs[0].device, self.model_parallel)
         for block in self.h:
             if output_hidden_states:
                 all_hidden_states += (outputs[0], )
             if self.model_parallel:
                 torch.cuda.set_device(outputs[0].device)
-                outputs = move_data(outputs, outputs[0].device)
-            # print(block.device, outputs[0].device)
+                outputs = move_data(outputs, block.device)
+            print(block.device, outputs[0].device)
             outputs = block(outputs)
             # print(hidden_states)
         # all_hidden_states += (outputs[0], )
         if self.model_parallel:
             torch.cuda.set_device(outputs[0].device)
-            outputs = move_data(outputs, outputs[0].device)
-        # print(block.device, outputs[0].device)
+            outputs = move_data(outputs, self.out.device)
+        print(block.device, outputs[0].device)
         outputs = self.out(outputs)
         # exit()
         

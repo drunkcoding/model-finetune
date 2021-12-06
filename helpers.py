@@ -18,16 +18,11 @@ def forward_wrapper_dict(model, batch):
 
     return logits, batch['labels'].to(0)
 
-def train_step(model, optimizer, lr_scheduler, batch, forward_wrapper, loss_fn):
+def train_step(model, batch, forward_wrapper, loss_fn):
     model.train()
     outputs, labels = forward_wrapper(model, batch)
     # print(outputs)
     loss = loss_fn(outputs.to(labels.device), labels)
-    loss.backward()
-    
-    optimizer.step()
-    lr_scheduler.step()
-    optimizer.zero_grad()
 
     return loss
 
@@ -86,6 +81,7 @@ def test_parameters_consistency(model_gold, model_test, abort=True):
         param_gold = param_gold.detach().cpu().numpy()
 
         if abort:
+            print(name_gold, name_test, param_gold.shape, param_test.shape)
             assert np.all(np.isclose(
                 param_test,
                 param_gold

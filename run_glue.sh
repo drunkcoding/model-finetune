@@ -75,18 +75,20 @@ deepspeed run_glue_deepspeed.py \
     --do_eval \
     --per_device_train_batch_size ${batch_size} \
     --learning_rate ${learning_rate} \
-    --num_train_epochs 5 \
+    --num_train_epochs 4 \
     --save_strategy steps \
     --logging_strategy steps \
     --load_best_model_at_end \
     --evaluation_strategy steps \
-    --eval_steps 350 \
-    --save_steps 350 \
-    --logging_steps 350 \
+    --eval_steps 50 \
+    --save_steps 50 \
+    --gradient_accumulation_steps 8 \
+    --logging_steps 50 \
+    --save_total_limit 5 \
     --warmup_steps 100 \
     --weight_decay 0.01 \
-    --output_dir ./outputs/${model_name}/${task_name}/ \
-    --overwrite_output_dir &> ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log
+    --output_dir ./outputs/${model_name}/${task_name}/
+    &> ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log
 
 # =========================
 # Post experiment logging
