@@ -59,25 +59,32 @@ set -e
 
 task_name=$1
 model_name=$2
-batch_size=8
+batch_size=64
 base_dir=$4
 learning_rate=$3
 
 mkdir -p ./outputs/${model_name}/${task_name}/
 mkdir -p ./log/${model_name}/${task_name}/
 
-deepspeed run_glue_no_trainer_ds_pp.py \
-    --model_name_or_path ${base_dir}/${model_name} \
-    --deepspeed_config ds_cfg_pp.json \
+deepspeed run_glue.py \
+    --model_name_or_path  ${base_dir}/${model_name} \
     --task_name ${task_name} \
-    --pad_to_max_length \
-    --max_length 128 \
+    --max_seq_length 128 \
+    --overwrite_cache False \
+    --fp16 \
+    --do_train \
+    --do_eval \
     --per_device_train_batch_size ${batch_size} \
     --learning_rate ${learning_rate} \
-    --num_train_epochs 5 \
-    --per_device_train_batch_size ${batch_size} \
+    --num_train_epochs 200 \
+    --save_strategy epoch \
+    --logging_strategy epoch \
+    --evaluation_strategy epoch \
+    --load_best_model_at_end \
+    --fp16_opt_level O3 \
+    --warmup_steps 100 \
     --output_dir ./outputs/${model_name}/${task_name}/ \
-    | tee ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log 
+    --overwrite_output_dir &> ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log
 
 
 # =========================

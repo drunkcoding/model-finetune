@@ -442,13 +442,15 @@ def main():
                 break
 
         model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-            metric.add_batch(
-                predictions=predictions,
-                references=batch["labels"],
-            )
+        with torch.no_grad():
+            for step, batch in enumerate(eval_dataloader):
+                batch = BatchEncoding(batch).to(torch.cuda.current_device())
+                outputs = model(**batch)
+                predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+                metric.add_batch(
+                    predictions=predictions,
+                    references=batch["labels"],
+                )
 
         eval_metric = metric.compute()
         logger.info(f"epoch {epoch}: {eval_metric}")
@@ -467,13 +469,15 @@ def main():
         # eval_dataloader = accelerator.prepare(eval_dataloader)
 
         model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            metric.add_batch(
-                predictions=predictions,
-                references=batch["labels"],
-            )
+        with torch.no_grad():
+            for step, batch in enumerate(eval_dataloader):
+                batch = BatchEncoding(batch).to(torch.cuda.current_device())
+                outputs = model(**batch)
+                predictions = outputs.logits.argmax(dim=-1)
+                metric.add_batch(
+                    predictions=predictions,
+                    references=batch["labels"],
+                )
 
         eval_metric = metric.compute()
         logger.info(f"mnli-mm: {eval_metric}")

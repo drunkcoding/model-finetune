@@ -19,20 +19,25 @@ import math
 import os
 import random
 from pathlib import Path
-import asyncio
-from types import prepare_class
-import numpy as np
+from deepspeed.runtime.dataloader import RepeatingLoader
+
+from scipy import stats
+from tqdm import trange
+
+from deepspeed.runtime.pipe.module import PipelineModule
+from deepspeed.utils.groups import initialize_model_parallel
+
+from partitioner import GPT2ModelPipe, GPTModelPipe, get_loss_fn
 
 import datasets
 from datasets import load_dataset, load_metric
-from torch.optim import optimizer
+import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-import torch
 
 import transformers
-# from accelerate import Accelerator
-from huggingface_hub import Repository
+import deepspeed
+# from megatron import mpu
 from transformers import (
     AdamW,
     AutoConfig,
@@ -46,16 +51,18 @@ from transformers import (
     set_seed,
 )
 from transformers.file_utils import get_full_repo_name
-from transformers.tokenization_utils_base import BatchEncoding, EncodedInput
 from transformers.utils.versions import require_version
-from helpers import eval_step, forward_wrapper_dict, forward_wrapper_tuple, prepare_model, test_parameters_consistency, train_step
+from transformers import BatchEncoding
+from transformers.deepspeed import HfDeepSpeedConfig, HfTrainerDeepSpeedConfig
 
-from partitioner import GPTModelPipe, get_loss_fn
 
+MP_SIZE = torch.cuda.device_count()
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 logger = logging.getLogger(__name__)
 
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
+require_version("datasets>=1.8.0",
+                "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 
 task_to_keys = {
     "cola": ("sentence", None),
@@ -71,7 +78,8 @@ task_to_keys = {
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
+    parser = argparse.ArgumentParser(
+        description="Finetune a transformers model on a text classification task")
     parser.add_argument(
         "--task_name",
         type=str.lower,
@@ -128,8 +136,10 @@ def parse_args():
         default=5e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
+    parser.add_argument("--weight_decay", type=float,
+                        default=0.0, help="Weight decay to use.")
+    parser.add_argument("--num_train_epochs", type=int, default=3,
+                        help="Total number of training epochs to perform.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -147,30 +157,46 @@ def parse_args():
         type=SchedulerType,
         default="linear",
         help="The scheduler type to use.",
-        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+        choices=["linear", "cosine", "cosine_with_restarts",
+                 "polynomial", "constant", "constant_with_warmup"],
     )
     parser.add_argument(
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
-    parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Where to store the final model.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="A seed for reproducible training.")
+    parser.add_argument("--push_to_hub", action="store_true",
+                        help="Whether or not to push the model to the Hub.")
     parser.add_argument(
         "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
     )
-    parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
+    parser.add_argument("--hub_token", type=str,
+                        help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="Deepspeed auto local rank.",
+    )
+    parser = deepspeed.add_config_arguments(parser)
+    parser = deepspeed.add_tuning_arguments(parser)
     args = parser.parse_args()
 
     # Sanity checks
     if args.task_name is None and args.train_file is None and args.validation_file is None:
-        raise ValueError("Need either a task name or a training/validation file.")
+        raise ValueError(
+            "Need either a task name or a training/validation file.")
     else:
         if args.train_file is not None:
             extension = args.train_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`train_file` should be a csv or a json file."
+            assert extension in [
+                "csv", "json"], "`train_file` should be a csv or a json file."
         if args.validation_file is not None:
             extension = args.validation_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
+            assert extension in [
+                "csv", "json"], "`validation_file` should be a csv or a json file."
 
     if args.push_to_hub:
         assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
@@ -180,6 +206,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    deepspeed_config = HfDeepSpeedConfig(args.deepspeed_config)
+
+    # mpu.get_model_parallel_world_size = lambda: torch.cuda.device_count()
+    # mpu.get_model_parallel_rank = lambda: args.local_rank
+
+    # mpu.initialize_model_parallel(torch.cuda.device_count())
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # accelerator = Accelerator()
@@ -193,13 +226,13 @@ def main():
 
     # Setup logging, we only want one process per machine to log things on the screen.
     # accelerator.is_local_main_process is only True for one process per machine.
-    # logger.setLevel(logging.INFO if accelerator.is_local_main_process else logging.ERROR)
-    # if accelerator.is_local_main_process:
-    #     datasets.utils.logging.set_verbosity_warning()
-    #     transformers.utils.logging.set_verbosity_info()
-    # else:
-    datasets.utils.logging.set_verbosity_error()
-    transformers.utils.logging.set_verbosity_error()
+    logger.setLevel(logging.INFO if args.local_rank <= 0 else logging.ERROR)
+    if args.local_rank <= 0:
+        datasets.utils.logging.set_verbosity_warning()
+        transformers.utils.logging.set_verbosity_info()
+    else:
+        datasets.utils.logging.set_verbosity_error()
+        transformers.utils.logging.set_verbosity_error()
 
     # If passed along, set the training seed now.
     if args.seed is not None:
@@ -227,7 +260,8 @@ def main():
             data_files["train"] = args.train_file
         if args.validation_file is not None:
             data_files["validation"] = args.validation_file
-        extension = (args.train_file if args.train_file is not None else args.valid_file).split(".")[-1]
+        extension = (
+            args.train_file if args.train_file is not None else args.valid_file).split(".")[-1]
         raw_datasets = load_dataset(extension, data_files=data_files)
     # See more about loading any type of standard or custom dataset at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
@@ -242,7 +276,8 @@ def main():
             num_labels = 1
     else:
         # Trying to have good defaults here, don't hesitate to tweak to your needs.
-        is_regression = raw_datasets["train"].features["label"].dtype in ["float32", "float64"]
+        is_regression = raw_datasets["train"].features["label"].dtype in [
+            "float32", "float64"]
         if is_regression:
             num_labels = 1
         else:
@@ -256,14 +291,17 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+    config = AutoConfig.from_pretrained(
+        args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
     )
 
+    # hack gpt2 token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = 50256
@@ -273,7 +311,8 @@ def main():
         sentence1_key, sentence2_key = task_to_keys[args.task_name]
     else:
         # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
-        non_label_column_names = [name for name in raw_datasets["train"].column_names if name != "label"]
+        non_label_column_names = [
+            name for name in raw_datasets["train"].column_names if name != "label"]
         if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
             sentence1_key, sentence2_key = "sentence1", "sentence2"
         else:
@@ -285,18 +324,21 @@ def main():
     # Some models have set the order of the labels to use, so let's make sure we do use it.
     label_to_id = None
     if (
-        model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
+        model.config.label2id != PretrainedConfig(
+            num_labels=num_labels).label2id
         and args.task_name is not None
         and not is_regression
     ):
         # Some have all caps in their config, some don't.
-        label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
+        label_name_to_id = {
+            k.lower(): v for k, v in model.config.label2id.items()}
         if list(sorted(label_name_to_id.keys())) == list(sorted(label_list)):
             logger.info(
                 f"The configuration of the model provided the following label correspondence: {label_name_to_id}. "
                 "Using it!"
             )
-            label_to_id = {i: label_name_to_id[label_list[i]] for i in range(num_labels)}
+            label_to_id = {
+                i: label_name_to_id[label_list[i]] for i in range(num_labels)}
         else:
             logger.warning(
                 "Your model seems to have been trained with labels, but they don't match the dataset: ",
@@ -308,19 +350,23 @@ def main():
 
     if label_to_id is not None:
         model.config.label2id = label_to_id
-        model.config.id2label = {id: label for label, id in config.label2id.items()}
+        model.config.id2label = {
+            id: label for label, id in config.label2id.items()}
     elif args.task_name is not None and not is_regression:
         model.config.label2id = {l: i for i, l in enumerate(label_list)}
-        model.config.id2label = {id: label for label, id in config.label2id.items()}
+        model.config.id2label = {
+            id: label for label, id in config.label2id.items()}
 
     padding = "max_length" if args.pad_to_max_length else False
 
     def preprocess_function(examples):
         # Tokenize the texts
         texts = (
-            (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
+            (examples[sentence1_key],) if sentence2_key is None else (
+                examples[sentence1_key], examples[sentence2_key])
         )
-        result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
+        result = tokenizer(*texts, padding=padding,
+                           max_length=args.max_length, truncation=True)
 
         if "label" in examples:
             if label_to_id is not None:
@@ -331,7 +377,6 @@ def main():
                 result["labels"] = examples["label"]
         return result
 
-    # with accelerator.main_process_first():
     processed_datasets = raw_datasets.map(
         preprocess_function,
         batched=True,
@@ -340,11 +385,13 @@ def main():
     )
 
     train_dataset = processed_datasets["train"]
-    eval_dataset = processed_datasets["validation_matched" if args.task_name == "mnli" else "validation"]
+    eval_dataset = processed_datasets["validation_matched" if args.task_name ==
+                                      "mnli" else "validation"]
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+        logger.info(
+            f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # DataLoaders creation:
     if args.pad_to_max_length:
@@ -355,36 +402,73 @@ def main():
         # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
         # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
         # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None))
+        data_collator = DataCollatorWithPadding(
+            tokenizer, pad_to_multiple_of=(8 if args.fp16 else None))
 
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size, drop_last=True
     )
-    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    eval_dataloader = DataLoader(
+        eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size, drop_last=True)
 
-    # new model
-    loss_fn = get_loss_fn(model, next(iter(train_dataloader))['labels'])
-    # model = GPTModelPipe(model.config, "classification", model)
-    # model.parallelize()
-    # model.transformer.parallelize()
-    # model.score = model.score.to(model.transformer.last_device)
+    # Optimizer
+    # Split weights in two groups, one with weight decay and the other not.
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Prepare everything with our `accelerator`.
     # model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
     #     model, optimizer, train_dataloader, eval_dataloader
     # )
 
+    # create pipeline module
+    # model.train()
+    model_pipe = GPTModelPipe(model.config, "classification", model)
+    # # model_pipe.train()
+    # model_pipe.copy_weights(model)
+    # print(train_dataset[0])
+    loss_fn = get_loss_fn(model, next(iter(train_dataloader))['labels'])
+
+    deepspeed.init_distributed()
+    initialize_model_parallel(1)
+    # model = GPT2ModelPipe(model.config, "classification", loss_fn, model=model,
+    #                       partition_method="uniform", num_stages=torch.cuda.device_count())
+    model_pipe = PipelineModule(
+        model_pipe.to_layers(),
+        loss_fn=loss_fn,
+        num_stages=torch.cuda.device_count(),
+        partition_method="uniform",
+    )
+    # model = model_pipe
+
+    engine, optimizer, _, _ = deepspeed.initialize(
+        args, model_pipe,
+        model_parameters=optimizer_grouped_parameters,
+        # training_data=train_dataset,
+        # collate_fn=data_collator
+    )
+
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
 
     # Scheduler and math around the number of training steps.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     else:
-        args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    
+        args.num_train_epochs = math.ceil(
+            args.max_train_steps / num_update_steps_per_epoch)
 
     # Get the metric function
     if args.task_name is not None:
@@ -393,200 +477,121 @@ def main():
         metric = load_metric("accuracy")
 
     # Train!
-    # total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
+    total_batch_size = args.per_device_train_batch_size * \
+        torch.cuda.device_count() * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(
+        f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(
+        f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps))
+    progress_bar = tqdm(range(args.max_train_steps),
+                        disable=not args.local_rank <= 0)
     completed_steps = 0
 
-    task_accum_steps = 10
+    def batch_iterator(dataloader):
+        for batch in dataloader:
+            batch = BatchEncoding(batch).to(torch.cuda.current_device())
+            # print(batch)
+            yield (
+                (batch.get('input_ids'), batch.get('attention_mask')),
+                batch.get('labels')
+            )
 
-    async def model_exec(model, batch, step):
-        await asyncio.sleep((step % task_accum_steps) * 0.01)
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        labels = batch['labels'].to(model.last_device)
-        outputs = model((input_ids, attention_mask))
+    train_dataloader = RepeatingLoader(train_dataloader)
+    train_data_iter = batch_iterator(train_dataloader)
 
-        loss = loss_fn(outputs, labels)
-        loss = loss / args.gradient_accumulation_steps
-        
-        return loss
+    eval_dataloader = RepeatingLoader(eval_dataloader)
+    eval_data_iter = batch_iterator(eval_dataloader)
 
-    # loop = asyncio.new_event_loop()
+    # model.train()
+    m_bsz = deepspeed_config.get_value('train_micro_batch_size_per_gpu')
+    gas = deepspeed_config.get_value('gradient_accumulation_steps')
+    steps_per_epoch = len(train_dataset) // (gas * m_bsz)
 
-    # model_gold = AutoModelForSequenceClassification.from_pretrained(
-    #     args.model_name_or_path,
-    #     from_tf=bool(".ckpt" in args.model_name_or_path),
-    #     config=config,
-    # ).cpu()
-    model_gold = model.cpu()
-    model_test = GPTModelPipe(model_gold.config, "classification", model_gold).cpu()
-    model_test.eval()
-    model_gold.eval()
+    eval_loss_list = []
+    train_loss_list = []
+    for step in trange(steps_per_epoch * args.num_train_epochs , desc="Training"):
+        train_loss_list = []
+        train_loss = engine.train_batch(train_data_iter)
+        train_loss_list.append(train_loss.detach().cpu().item())
 
-    model_gold.config.pad_token_id = 50256
-    model_test.config.pad_token_id = 50256
+        if (step + 1) % steps_per_epoch == 0:
+            for step in trange(len(eval_dataset) // (gas * m_bsz), desc="Evaluating"):
+                eval_loss = engine.eval_batch(eval_data_iter)
+                eval_loss_list.append(eval_loss.detach().cpu().item())
+            
+            print("epoch (%s) train_loss %s, eval_loss %s" % ((step + 1) // steps_per_epoch, stats.describe(train_loss_list), stats.describe(eval_loss_list)))
+            train_loss_list = []
+            eval_loss_list = []
 
-    test_parameters_consistency(model_gold, model_test)
+            engine.save_checkpoint(args.output_dir, tag=str(step))
 
-    with torch.no_grad():
-        for step, batch in enumerate(tqdm(train_dataloader)):
-            batch = BatchEncoding(batch).to("cpu")
-            input_ids = batch['input_ids']
-            attention_mask = batch['attention_mask']
-            labels = batch['labels']
+    return
 
-            output_gold = model_gold(**batch, output_hidden_states=True)
-            hidden_states_gold = output_gold.hidden_states
-            logits_gold = output_gold.logits.detach().cpu().numpy()
-            output_test, hidden_states_test = model_test((input_ids, attention_mask), output_hidden_states=True)
-            logits_test = output_test[0].detach().cpu().numpy()
-            # hidden_states_test = output_test[1]
-            print(logits_gold-logits_test)
-            print(len(hidden_states_test), len(hidden_states_gold))
-            assert len(hidden_states_test) == len(hidden_states_gold)
-            for i in range(len(hidden_states_gold)):
-                # print(i, hidden_states_gold[i]-hidden_states_test[i])
-                assert np.all(np.isclose(
-                    hidden_states_gold[i].detach().cpu().numpy(),
-                    hidden_states_test[i].detach().cpu().numpy()
-                ))
-
-            assert np.all(np.isclose(
-                logits_gold,
-                logits_test
-            ))
-
-            break
-
-    model_test, optimizer_test, lr_scheduler_test = prepare_model(args, model_test)
-    # model_gold, optimizer_gold, lr_scheduler_gold = prepare_model(args, model_gold)
-
-    model_test.parallelize()
-
-    model_test.train()
-    # model_gold.train()
     for epoch in range(args.num_train_epochs):
-        # tasks = []
-        # for step, batch in enumerate(train_dataloader):
-        #     tasks.append(loop.create_task(model_exec(model, batch, step))
-            
-        #     if len(tasks) == task_accum_steps:
-        #         done, pending = loop.run_until_complete(asyncio.wait(tasks))
-        #         # print(len(done), len(pending))
-        #         for step, future in enumerate(set.union(done, pending)):
-        #             loss = future.result()
-        #             loss.backward()
-        #             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-        #                 optimizer.step()
-        #                 lr_scheduler.step()
-        #                 optimizer.zero_grad()
-        #                 progress_bar.update(1)
-        #                 completed_steps += 1
 
-        #             if completed_steps >= args.max_train_steps:
-        #                 break
+        train_loss_list = []
+        eval_loss_list = []
+        for step in trange(len(train_dataset) // (gas * m_bsz) , desc="Training"):
+            train_loss = model.train_batch(train_data_iter)
+            train_loss_list.append(train_loss.detach().cpu().item())
+        for step in trange(len(eval_dataset) // (gas * m_bsz), desc="Evaluating"):
+            eval_loss = model.eval_batch(eval_data_iter)
+            eval_loss_list.append(eval_loss.detach().cpu().item())
 
-        #         tasks = []
+        # print("========================================================")
+        print("epoch (%s) train_loss %s, eval_loss %s" % (
+            epoch+1, stats.describe(train_loss_list), stats.describe(eval_loss_list)))
 
-        model_test = model_test.to(0)
-        # model_gold = model_gold.to(0)
+    return
+
+    print("========================================================")
+
+    for epoch in range(args.num_train_epochs):
+        model.train()
         for step, batch in enumerate(train_dataloader):
-
-            train_step(model_test, optimizer_test, lr_scheduler_test, batch, forward_wrapper_tuple, loss_fn)
-            # train_step(model_gold, optimizer_gold, lr_scheduler_gold, batch, forward_wrapper_dict, loss_fn)
-
-            # input_ids = batch['input_ids'].to(model_test.first_device)
-            # attention_mask = batch['attention_mask'].to(model_test.first_device)
-            # labels = batch['labels'].to(model_test.last_device)
-            # outputs = model_test((input_ids, attention_mask))
-            # logits = outputs[0]
-            # loss = loss_fn(logits, labels)
-
-            # output_gold = model_gold(**batch)
-            # hidden_states_gold = output_gold.hidden_states
-            # logits_gold = output_gold.logits.detach().cpu().numpy()
-            # loss_gold = loss_fn(logits_gold, labels)
-
-            # loss_gold = loss_gold / args.gradient_accumulation_steps
-            # loss_gold.backward()
-
-            # print(loss)
-            # labels = batch['labels'].to(model.transformer.last_device)
-            # del batch['labels']
-            # batch = BatchEncoding(batch).to(model.transformer.first_device)
-            # logits = model(**batch).logits
-            # loss = loss_fn(logits, labels)
-            
-            # batch = BatchEncoding(batch).to(model.transformer.first_device)
-            # batch['labels'] = batch['labels'].to(model.transformer.last_device)
+            batch = BatchEncoding(batch).to(torch.cuda.current_device())
             # outputs = model(**batch)
             # loss = outputs.loss
-
-            # loss = loss / args.gradient_accumulation_steps
-            # loss.backward()
-            # if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-            #     optimizer.step()
-            #     lr_scheduler.step()
-            #     optimizer.zero_grad()
-            #     progress_bar.update(1)
-            #     completed_steps += 1
-
-            progress_bar.update(1)
-            completed_steps += 1
+            # loss = model.train
+            loss = loss / args.gradient_accumulation_steps
+            model.backward(loss)
+            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                optimizer.step()
+                optimizer.zero_grad()
+                progress_bar.update(1)
+                completed_steps += 1
 
             if completed_steps >= args.max_train_steps:
                 break
 
-        # test_parameters_consistency(model_gold, model_test, abort=False)
-
-        model_test.eval()
-        # model_gold.eval()
-        for step, batch in enumerate(eval_dataloader):
-            # input_ids = batch['input_ids'].to(model_test.first_device)
-            # attention_mask = batch['attention_mask'].to(model_test.first_device)
-            # labels = batch['labels'].to(model_test.last_device)
-            # outputs = model_test((input_ids, attention_mask))
-            # logits = outputs[0]
-            # predictions = logits.argmax(dim=-1) if not is_regression else logits.squeeze()
-
-            loss, logits = eval_step(model_test, batch, forward_wrapper_tuple, loss_fn)
-            predictions = logits.argmax(dim=-1) if not is_regression else logits.squeeze()
-            # eval_step(model_gold, batch, forward_wrapper_dict, loss_fn)
-            
-            # labels = batch['labels'].to(model.transformer.last_device)
-            # del batch['labels']
-            # batch = BatchEncoding(batch).to(model.transformer.first_device)
-            # logits = model(**batch).logits
-            # predictions = logits.argmax(dim=-1) if not is_regression else outputs.squeeze()
-
-            # batch = BatchEncoding(batch).to(model.transformer.first_device)
-            # batch['labels'] = batch['labels'].to(model.transformer.last_device)
-            # outputs = model(**batch)
-            # predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-            
-            metric.add_batch(
-                predictions=predictions.detach().cpu(),
-                references=batch['labels'].detach().cpu(),
-            )
+        model.eval()
+        with torch.no_grad():
+            for step, batch in enumerate(eval_dataloader):
+                batch = BatchEncoding(batch).to(torch.cuda.current_device())
+                outputs = model(**batch)
+                predictions = outputs.logits.argmax(
+                    dim=-1) if not is_regression else outputs.logits.squeeze()
+                metric.add_batch(
+                    predictions=predictions,
+                    references=batch["labels"],
+                )
 
         eval_metric = metric.compute()
         logger.info(f"epoch {epoch}: {eval_metric}")
 
-        if args.output_dir is not None:
-            epoch_chk_path = os.path.join(args.output_dir, f"epoch-{epoch}")
-            # model.save_pretrained(epoch_chk_path)
-            torch.save(model_test.state_dict(), os.path.join(epoch_chk_path, "python_model.bin"))
-            tokenizer.save_pretrained(epoch_chk_path)
+    if args.output_dir is not None:
+        model.save_checkpoint(args.output_dir, save_latest=True)
+        if args.local_rank <= 0:
+            tokenizer.save_pretrained(args.output_dir)
+
     if args.task_name == "mnli":
         # Final evaluation on mismatched validation set
         eval_dataset = processed_datasets["validation_mismatched"]
@@ -596,13 +601,15 @@ def main():
         # eval_dataloader = accelerator.prepare(eval_dataloader)
 
         model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            metric.add_batch(
-                predictions=predictions,
-                references=batch["labels"],
-            )
+        with torch.no_grad():
+            for step, batch in enumerate(eval_dataloader):
+                batch = BatchEncoding(batch).to(torch.cuda.current_device())
+                outputs = model(**batch)
+                predictions = outputs.logits.argmax(dim=-1)
+                metric.add_batch(
+                    predictions=predictions,
+                    references=batch["labels"],
+                )
 
         eval_metric = metric.compute()
         logger.info(f"mnli-mm: {eval_metric}")
