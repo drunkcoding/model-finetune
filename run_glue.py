@@ -26,14 +26,12 @@ from typing import Optional
 import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
-from torch.nn.modules.loss import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 import transformers
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    AutoModel,
     DataCollatorWithPadding,
     EvalPrediction,
     HfArgumentParser,
@@ -46,19 +44,10 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
-from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
-import deepspeed
-from tqdm import tqdm
-
-import torch
-from torch.utils.data import DataLoader, SequentialSampler
-
-MP_SIZE = torch.cuda.device_count()
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-# check_min_version("4.13.0.dev0")
+check_min_version("4.12.0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 
@@ -76,19 +65,6 @@ task_to_keys = {
 
 logger = logging.getLogger(__name__)
 
-class Dataset(torch.utils.data.Dataset):
-    def __init__(self, encodings, labels):
-        self.encodings = encodings
-        self.labels = labels
-
-    def __getitem__(self, idx):
-        item = {key: val[idx] for key, val in self.encodings.items()}
-        item['labels'] = self.labels[idx]
-        return item
-        # return (item, self.labels[idx])
-
-    def __len__(self):
-        return len(self.labels)
 
 @dataclass
 class DataTrainingArguments:
@@ -223,86 +199,6 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    class GPTClassifier(torch.nn.Module):
-        def __init__(self, config):
-            super().__init__()
-            self.config = config
-            self.num_labels = config.num_labels
-            # classifier_dropout = (
-            #     config.classifier_dropout if config.classifier_dropout is not None else 0.1
-            # )
-            # self.dropout = torch.nn.Dropout(classifier_dropout)
-            # print("linear size", config.hidden_size, config.num_labels)
-            self.score = torch.nn.Linear(config.hidden_size, config.num_labels, bias=False)
-            self.drop = torch.nn.Dropout(0.1)
-            self.mixture = torch.nn.Linear(data_args.max_seq_length * config.num_labels, config.num_labels, bias=False)
-            # torch.nn.init.xavier_normal_(self.score.weight)
-
-        def forward(self, input_ids, hidden_states, labels=None, return_dict=None,):
-            # hidden_states = transformer_outputs[0]
-            # print(input_ids.shape, hidden_states.shape, labels.shape)
-            logits = self.score(hidden_states)
-            logits = self.drop(logits)
-            # logits = self.mixture(logits.reshape(logits.shape[0], -1))
-
-            batch_size, sequence_length = input_ids.shape[:2]
-
-            assert (
-                self.config.pad_token_id is not None or batch_size == 1
-            ), "Cannot handle batch sizes > 1 if no padding token is defined."
-            if self.config.pad_token_id is None:
-                sequence_lengths = -1
-            else:
-                if input_ids is not None:
-                    sequence_lengths = torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1
-                else:
-                    sequence_lengths = -1
-                    logger.warning(
-                        f"{self.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
-                        f"unexpected if using padding tokens in conjunction with `inputs_embeds.`"
-                    )
-            
-            pooled_logits = self.mixture(logits.reshape(batch_size, -1))
-            # pooled_logits = logits[torch.arange(batch_size), sequence_lengths]
-            # pooled_logits = torch.mean(logits, dim=1)
-            # print("logits", logits.shape)
-            # print("pooled_logits", pooled_logits.shape)
-
-            loss = None
-            if labels is not None:
-                if self.config.problem_type is None:
-                    if self.num_labels == 1:
-                        self.config.problem_type = "regression"
-                    elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                        self.config.problem_type = "single_label_classification"
-                    else:
-                        self.config.problem_type = "multi_label_classification"
-
-                if self.config.problem_type == "regression":
-                    loss_fct = MSELoss()
-                    if self.num_labels == 1:
-                        loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-                    else:
-                        loss = loss_fct(pooled_logits, labels)
-                elif self.config.problem_type == "single_label_classification":
-                    loss_fct = CrossEntropyLoss()
-                    loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-                elif self.config.problem_type == "multi_label_classification":
-                    loss_fct = BCEWithLogitsLoss()
-                    loss = loss_fct(pooled_logits, labels)
-            # if not return_dict:
-            #     output = (pooled_logits,) + transformer_outputs[1:]
-            #     return ((loss,) + output) if loss is not None else output
-
-            return SequenceClassifierOutputWithPast(
-                loss=loss,
-                logits=pooled_logits,
-                # past_key_values=transformer_outputs.past_key_values,
-                # hidden_states=transformer_outputs.hidden_states,
-                # attentions=transformer_outputs.attentions,
-            )
-
-
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -428,14 +324,6 @@ def main():
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         use_fast=model_args.use_fast_tokenizer,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
-    transformer_model = AutoModel.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
@@ -581,58 +469,9 @@ def main():
     else:
         data_collator = None
 
-
-    transformer_model = deepspeed.init_inference(transformer_model, mp_size=MP_SIZE)
-
-    # print(train_dataset[0])
-    transformer_model.eval()
-    def prepare_dataset(dataset):
-        # dataset = dataset[:100]
-        # sampler = SequentialSampler(dataset)
-        # loader = DataLoader(dataset, batch_size=32, sampler=sampler)
-
-        input_ids_batches = []
-        # attn_batches = []
-        label_batches = []
-        output_batches = []
-        for batch in tqdm(dataset, desc="Forwarding"):
-            # print(batch)
-            # input = {
-            #     'attention_mask': torch.reshape(torch.cat(batch['attention_mask']), (32, -1, )).type(torch.int),
-            #     'input_ids': torch.reshape(torch.cat(batch['input_ids']), (32, -1, )).type(torch.int),
-            # }
-            input = {
-                'attention_mask': torch.reshape(torch.Tensor(batch['attention_mask']), (1, -1, )).type(torch.int),
-                'input_ids': torch.reshape(torch.Tensor(batch['input_ids']), (1, -1, )).type(torch.int),
-            }
-            label = batch['label']
-            # print(input, label)
-
-            ouput = transformer_model(**input, return_dict=True)
-            input_ids_batches.append(input['input_ids'].detach().cpu())
-            # attn_batches.append(input['attention_mask'])
-            label_batches.append(label)
-            output_batches.append(ouput.last_hidden_state.detach().cpu().squeeze())
-
-        input_ids = torch.cat(input_ids_batches)
-        # input_ids = input_ids.reshape((input_ids.shape[0], 1, -1))
-        labels = torch.Tensor(label_batches).type(torch.long)
-
-        # print(input_ids.shape, labels.shape)
-
-        return Dataset({'input_ids': input_ids, 'hidden_states': output_batches}, labels)
-
-    # print(type(train_dataset), type(eval_dataset))
-    # print(train_dataset)
-
-    with torch.no_grad():
-        train_dataset = prepare_dataset(train_dataset) if training_args.do_train else None
-        eval_dataset = prepare_dataset(eval_dataset) if training_args.do_eval else None
-    
-    classifier = GPTClassifier(model.config)
     # Initialize our Trainer
     trainer = Trainer(
-        model=classifier,
+        model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
@@ -640,7 +479,6 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
-
 
     # Training
     if training_args.do_train:

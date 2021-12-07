@@ -187,8 +187,8 @@ def main():
 
     mpu.get_model_parallel_world_size = lambda: torch.cuda.device_count()
     mpu.get_model_parallel_rank = lambda: args.local_rank
-    deepspeed.init_distributed()
-    mpu.initialize_model_parallel(torch.cuda.device_count())
+    # deepspeed.init_distributed()
+    mpu.initialize_model_parallel(2, torch.cuda.device_count() // 2)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # accelerator = Accelerator()

@@ -20,6 +20,7 @@ import os
 import random
 from pathlib import Path
 from deepspeed.runtime.dataloader import RepeatingLoader
+from helpers import get_optimizer_grouped_parameters
 
 from scipy import stats
 from tqdm import trange
@@ -27,7 +28,7 @@ from tqdm import trange
 from deepspeed.runtime.pipe.module import PipelineModule
 from deepspeed.utils.groups import initialize_model_parallel
 
-from partitioner import GPT2ModelPipe, GPTModelPipe, get_loss_fn
+from partitioner import GPTModelPipe, get_loss_fn
 
 import datasets
 from datasets import load_dataset, load_metric
@@ -413,18 +414,18 @@ def main():
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    # no_decay = ["bias", "LayerNorm.weight"]
+    # optimizer_grouped_parameters = [
+    #     {
+    #         "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+    #         "weight_decay": args.weight_decay,
+    #     },
+    #     {
+    #         "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+    #         "weight_decay": 0.0,
+    #     },
+    # ]
+    # optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Prepare everything with our `accelerator`.
     # model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
@@ -438,6 +439,8 @@ def main():
     # model_pipe.copy_weights(model)
     # print(train_dataset[0])
     loss_fn = get_loss_fn(model, next(iter(train_dataloader))['labels'])
+
+    optimizer_grouped_parameters = get_optimizer_grouped_parameters(args, model_pipe)
 
     deepspeed.init_distributed()
     initialize_model_parallel(1)

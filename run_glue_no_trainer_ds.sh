@@ -59,9 +59,9 @@ set -e
 
 task_name=$1
 model_name=$2
-batch_size=8
-base_dir=$4
 learning_rate=$3
+batch_size=4
+base_dir=$4
 
 mkdir -p ./outputs/${model_name}/${task_name}/
 mkdir -p ./log/${model_name}/${task_name}/
@@ -74,7 +74,7 @@ deepspeed run_glue_no_trainer_ds_pp.py \
     --max_length 128 \
     --per_device_train_batch_size ${batch_size} \
     --learning_rate ${learning_rate} \
-    --num_train_epochs 5 \
+    --num_train_epochs 4 \
     --per_device_train_batch_size ${batch_size} \
     --output_dir ./outputs/${model_name}/${task_name}/ \
     | tee ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log 

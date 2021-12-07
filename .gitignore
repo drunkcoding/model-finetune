@@ -4,6 +4,9 @@ log/
 TestResult/
 figures/
 wandb/
+*.out
+cpu_adam/
+utils/
 tensorboard/
 
 # Byte-compiled / optimized / DLL files

@@ -59,33 +59,36 @@ set -e
 
 task_name=$1
 model_name=$2
-batch_size=64
 base_dir=$4
+batch_size=4
 learning_rate=$3
 
 mkdir -p ./outputs/${model_name}/${task_name}/
 mkdir -p ./log/${model_name}/${task_name}/
 
-deepspeed run_glue.py \
+deepspeed run_glue_deepspeed.py \
+    --deepspeed deepspeed_cfg.json \
     --model_name_or_path  ${base_dir}/${model_name} \
     --task_name ${task_name} \
     --max_seq_length 128 \
-    --overwrite_cache False \
-    --fp16 \
     --do_train \
     --do_eval \
     --per_device_train_batch_size ${batch_size} \
     --learning_rate ${learning_rate} \
-    --num_train_epochs 200 \
-    --save_strategy epoch \
-    --logging_strategy epoch \
-    --evaluation_strategy epoch \
+    --num_train_epochs 4 \
+    --save_strategy steps \
+    --logging_strategy steps \
     --load_best_model_at_end \
-    --fp16_opt_level O3 \
+    --evaluation_strategy steps \
+    --eval_steps 50 \
+    --save_steps 50 \
+    --gradient_accumulation_steps 8 \
+    --logging_steps 50 \
+    --save_total_limit 5 \
     --warmup_steps 100 \
-    --output_dir ./outputs/${model_name}/${task_name}/ \
-    --overwrite_output_dir &> ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log
-
+    --weight_decay 0.01 \
+    --output_dir ./outputs/${model_name}/${task_name}/
+    &> ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log
 
 # =========================
 # Post experiment logging

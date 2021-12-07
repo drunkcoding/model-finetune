@@ -59,7 +59,7 @@ set -e
 
 task_name=$1
 model_name=$2
-batch_size=32
+batch_size=4
 base_dir=$4
 learning_rate=$3
 
@@ -75,6 +75,7 @@ python run_glue_no_trainer_pp.py \
     --learning_rate ${learning_rate} \
     --num_train_epochs 5 \
     --per_device_train_batch_size ${batch_size} \
+    --gradient_accumulation_steps 8 \
     --output_dir ./outputs/${model_name}/${task_name}/ \
     | tee ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log 
 

@@ -468,10 +468,11 @@ def main():
 
             break
 
+    model_test.parallelize()
+
     model_test, optimizer_test, lr_scheduler_test = prepare_model(args, model_test)
     # model_gold, optimizer_gold, lr_scheduler_gold = prepare_model(args, model_gold)
-
-    model_test.parallelize()
+    
 
     model_test.train()
     # model_gold.train()
@@ -498,11 +499,11 @@ def main():
 
         #         tasks = []
 
-        model_test = model_test.to(0)
+        # model_test = model_test.to(0)
         # model_gold = model_gold.to(0)
         for step, batch in enumerate(train_dataloader):
 
-            train_step(model_test, optimizer_test, lr_scheduler_test, batch, forward_wrapper_tuple, loss_fn)
+            loss = train_step(model_test, batch, forward_wrapper_tuple, loss_fn)
             # train_step(model_gold, optimizer_gold, lr_scheduler_gold, batch, forward_wrapper_dict, loss_fn)
 
             # input_ids = batch['input_ids'].to(model_test.first_device)
@@ -532,17 +533,14 @@ def main():
             # outputs = model(**batch)
             # loss = outputs.loss
 
-            # loss = loss / args.gradient_accumulation_steps
-            # loss.backward()
-            # if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-            #     optimizer.step()
-            #     lr_scheduler.step()
-            #     optimizer.zero_grad()
-            #     progress_bar.update(1)
-            #     completed_steps += 1
-
-            progress_bar.update(1)
-            completed_steps += 1
+            loss = loss / args.gradient_accumulation_steps
+            loss.backward()
+            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                optimizer_test.step()
+                lr_scheduler_test.step()
+                optimizer_test.zero_grad()
+                progress_bar.update(1)
+                completed_steps += 1
 
             if completed_steps >= args.max_train_steps:
                 break

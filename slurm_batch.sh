@@ -14,6 +14,12 @@
 # run_experiment -b slurm_arrayjob.sh -e experiments.txt -m 12
 # ```
 
+#SBATCH --mail-user=leyang.xue@ed.ac.uk
+#SBATCH --mail-type=ALL
+#SBATCH --gres=gpu:8
+#SBATCH --partition=big
+#SBATCH --mem=64000
+#SBATCH --cpus-per-task=24
 
 # ====================
 # Options for sbatch
@@ -52,46 +58,6 @@ source ~/.bashrc
 # Make script bail out after first error
 set -e
 
-# Make your own folder on the node's scratch disk
-# N.B. disk could be at /disk/scratch_big, or /disk/scratch_fast. Check
-# yourself using an interactive session, or check the docs:
-#     http://computing.help.inf.ed.ac.uk/cluster-computing
-# SCRATCH_DISK=/disk/scratch
-# SCRATCH_HOME=${SCRATCH_DISK}/${USER}
-# mkdir -p ${SCRATCH_HOME}
-
-# Activate your conda environment
-#CONDA_ENV_NAME=stable-baselines
-#echo "Activating conda environment: ${CONDA_ENV_NAME}"
-#conda activate ${CONDA_ENV_NAME}
-
-
-# =================================
-# Move input data to scratch disk
-# =================================
-echo "Moving input data to the compute node's scratch space: $SCRATCH_DISK"
-
-# input data directory path on the DFS
-# proj_home=/home/${USER}/git/cluster-scripts  # you may need to change this
-# src_path=${proj_home}/experiments/examples/simple/data/input
-
-# input data directory path on the scratch disk of the node
-# dest_path=${SCRATCH_HOME}/simple/data/input
-# mkdir -p ${dest_path}  # make it if required
-
-# Important notes about rsync:
-# * the --compress option is going to compress the data before transfer to send
-#   as a stream. THIS IS IMPORTANT - transferring many files is very very slow
-# * the final slash at the end of ${src_path}/ is important if you want to send
-#   its contents, rather than the directory itself. For example, without a
-#   final slash here, we would create an extra directory at the destination:
-#       ${SCRATCH_HOME}/project_name/data/input/input
-# * for more about the (endless) rsync options, see the docs:
-#       https://download.samba.org/pub/rsync/rsync.html
-
-# rsync --archive --update --compress --progress ${src_path}/ ${dest_path}
-
-
 # ==============================
 # Finally, run the experiment!
 # ==============================
@@ -102,21 +68,19 @@ echo "Moving input data to the compute node's scratch space: $SCRATCH_DISK"
 
 # experiment_text_file=$1
 # COMMAND="`sed \"${SLURM_ARRAY_TASK_ID}q;d\" ${experiment_text_file}`"
-COMMAND="`bash run_glue_finetune.sh CoLA 10 FineTune gpt2`"
-echo "Running provided command: ${COMMAND}"
-eval "${COMMAND}"
-echo "Command ran successfully!"
 
+#source /etc/profile.d/modules.sh
+#module load cuda
 
-# ======================================
-# Move output data from scratch to DFS
-# ======================================
-echo "Moving output data back to DFS"
+MODULE="gpt-j-6B"
+LR=2e-5
+TASK="CoLA"
 
-src_path=${SCRATCH_HOME}/simple/data/output
-dest_path=${proj_home}/experiments/examples/simple/data/output
-# rsync --archive --update --compress --progress ${src_path}/ ${dest_path}
+echo "Job running ${MODULE}, ${LR}, ${TASK}"
 
+# bash run_glue.sh MNLI gpt-neo-2.7B 2e-5 ${HOME}/HuggingFace
+bash run_glue_no_trainer_pp.sh CoLA gpt-j-6B 2e-5 ${HOME}/HuggingFace
+# bash run_glue_no_trainer_ds.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
 
 # =========================
 # Post experiment logging
