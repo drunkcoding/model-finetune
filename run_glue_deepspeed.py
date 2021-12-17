@@ -44,6 +44,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
+from transformers import T5Tokenizer, T5ForConditionalGeneration
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 os.environ['TORCH_EXTENSIONS_DIR'] = os.getcwd()
@@ -329,7 +330,8 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForSequenceClassification.from_pretrained(
+    # model = AutoModelForSequenceClassification.from_pretrained(
+    model = T5ForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
@@ -340,7 +342,7 @@ def main():
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = 50256
+        model.config.pad_token_id = model.config.eos_token_id
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -472,6 +474,7 @@ def main():
         data_collator = None
 
     # Initialize our Trainer
+    model.parallelize()
     trainer = Trainer(
         model=model,
         args=training_args,

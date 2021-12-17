@@ -1,4 +1,4 @@
-from typing import ForwardRef
+from typing import ForwardRef, Tuple
 from deepspeed.runtime.activation_checkpointing import checkpointing
 from deepspeed.runtime.pipe.module import LayerSpec, PipelineModule
 from transformers.modeling_utils import PreTrainedModel
@@ -6,6 +6,7 @@ from transformers.models.auto.configuration_auto import model_type_to_module_nam
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.models.gpt_neo.modeling_gpt_neo import GPTNeoBlock
 from transformers.models.gptj.modeling_gptj import GPTJBlock
+from transformers import GPTNeoForSequenceClassification
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 from torch import nn
 import torch
@@ -447,6 +448,24 @@ class GPTOutput(DummyModule):
 
         return self
 
+# class GPTNeoPipe(GPTNeoForSequenceClassification):
+#     def __init__(self, path):
+#         self.model = GPTNeoForSequenceClassification.from_pretrained(path)
+#         self.exec_map = (0, self.num_layers)
+#         self.num_layers = get_num_layers(self.model.config) + 2
+
+#     def forward_layers(self, args):
+#         outputs = args
+#         for idx in range(*self.exec_map):
+#             # print(outputs[0].shape, outputs[1].shape)
+#             if idx == 0:
+#                 outputs = self.embed(outputs)
+#             elif idx == self.num_layers -1:
+#                 outputs = self.out(outputs)
+#             else:
+#                 outputs = self.h[idx-1](outputs)
+#         return outputs[0] if idx != self.num_layers -1 else outputs[1] # HACK since 0 is always hidden states
+
 
 class GPTModelPipe(nn.Module):
     def __init__(self, config, task_type, model=None):
@@ -464,6 +483,11 @@ class GPTModelPipe(nn.Module):
 
         # if model:
         #     self.copy_weights(model)
+        self.num_layers = get_num_layers(config) + 2
+
+        # self.layers = self.to_layers()
+
+        self.exec_map = (0, self.num_layers)
 
         self.model_parallel = False
 
@@ -483,12 +507,29 @@ class GPTModelPipe(nn.Module):
         return self
 
     def to(self, device):
-        self.embed.device  = device
-        for idx in range(len(self.h)):
-            self.h[idx].device  = device
-        self.out.device = device
+        # self.embed.device  = device
+        # for idx in range(len(self.h)):
+        #     self.h[idx].device  = device
+        # self.out.device = device
 
-        return super().to(device)
+        for idx in range(*self.exec_map):
+            if idx == 0:
+                self.embed.device  = device
+                self.embed = self.embed.to(device)
+            elif idx == self.num_layers -1:
+                self.out.device = device
+                self.out = self.out.to(device)
+            else:
+                self.h[idx-1].device  = device
+                self.h[idx-1].device  = self.h[idx-1].to(device)
+
+        return self #super().to(device)
+
+    def eval(self):
+        self.embed.eval()
+        for idx in range(len(self.h)):
+            self.h[idx].eval()
+        self.out.eval()
 
     def to_layers(self):
         # for h in self.h:
@@ -528,10 +569,21 @@ class GPTModelPipe(nn.Module):
         self.out = self.out.to("cpu")
         torch.cuda.empty_cache()
 
-    
+    def forward_layers(self, args):
+        outputs = args
+        for idx in range(*self.exec_map):
+            # print(outputs[0].shape, outputs[1].shape)
+            if idx == 0:
+                outputs = self.embed(outputs)
+            elif idx == self.num_layers -1:
+                outputs = self.out(outputs)
+            else:
+                outputs = self.h[idx-1](outputs)
+        return outputs[0] if idx != self.num_layers -1 else outputs[1] # HACK since 0 is always hidden states
 
     def forward(self, args, output_hidden_states=False):
         all_hidden_states = ()
+        
         outputs = self.embed(args)
         print(outputs[0].device, self.model_parallel)
         for block in self.h:

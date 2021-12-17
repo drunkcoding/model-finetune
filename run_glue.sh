@@ -67,7 +67,7 @@ mkdir -p ./outputs/${model_name}/${task_name}/
 mkdir -p ./log/${model_name}/${task_name}/
 
 deepspeed run_glue_deepspeed.py \
-    --deepspeed deepspeed_cfg.json \
+    --deepspeed deepspeed_cfg_auto.json \
     --model_name_or_path  ${base_dir}/${model_name} \
     --task_name ${task_name} \
     --max_seq_length 128 \
@@ -75,7 +75,7 @@ deepspeed run_glue_deepspeed.py \
     --do_eval \
     --per_device_train_batch_size ${batch_size} \
     --learning_rate ${learning_rate} \
-    --num_train_epochs 4 \
+    --num_train_epochs 5 \
     --save_strategy steps \
     --logging_strategy steps \
     --load_best_model_at_end \

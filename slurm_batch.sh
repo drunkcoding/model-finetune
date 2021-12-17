@@ -72,14 +72,15 @@ set -e
 #source /etc/profile.d/modules.sh
 #module load cuda
 
-MODULE="gpt-j-6B"
-LR=2e-5
-TASK="CoLA"
+MODULE="gpt2"
+LR=3e-5
+TASK="QQP"
 
 echo "Job running ${MODULE}, ${LR}, ${TASK}"
 
+bash run_glue.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
 # bash run_glue.sh MNLI gpt-neo-2.7B 2e-5 ${HOME}/HuggingFace
-bash run_glue_no_trainer_pp.sh CoLA gpt-j-6B 2e-5 ${HOME}/HuggingFace
+# bash run_glue_no_trainer_pp.sh CoLA gpt-j-6B 2e-5 ${HOME}/HuggingFace
 # bash run_glue_no_trainer_ds.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
 
 # =========================
