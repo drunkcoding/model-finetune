@@ -1,4 +1,5 @@
 
+from dataclasses import dataclass
 import numpy as np
 from transformers import AdamW, get_scheduler
 from transformers.tokenization_utils_base import BatchEncoding
@@ -88,3 +89,67 @@ def test_parameters_consistency(model_gold, model_test, abort=True):
             ))
         else:
             print(name_test, np.linalg.norm(param_gold-param_test))
+
+from accelerate import DeepSpeedPlugin
+import os
+
+@dataclass
+class DeepSpeedPluginComplete(DeepSpeedPlugin):
+
+    def __post_init__(self):
+
+        if self.gradient_accumulation_steps is None:
+            self.gradient_accumulation_steps = int(os.environ.get("GRADIENT_ACCUMULATION_STEPS", 1))
+
+        if self.zero_stage is None:
+            self.zero_stage = int(os.environ.get("DEEPSPEED_ZERO_STAGE", 2))
+
+        if self.offload_optimizer_device is None:
+            self.offload_optimizer_device = os.environ.get("DEEPSPEED_OFFLOAD_OPTIMIZER_DEVICE", "none")
+
+        self.deepspeed_config = self.ds_config = {
+            "train_batch_size": None,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "zero_optimization": {
+                "stage": self.zero_stage,
+                "offload_optimizer": {
+                    "device": self.offload_optimizer_device,
+                },
+                "offload_param": {
+                    "device": "cpu", 
+                    "pin_memory": True
+                }, 
+                "overlap_comm": True, 
+                "contiguous_gradients": True, 
+                "sub_group_size": 2e7, 
+                "reduce_bucket_size": 2e7, 
+                "stage3_prefetch_bucket_size": 2e7, 
+                "stage3_param_persistence_threshold": 2e7, 
+                "stage3_max_live_parameters": 2e7, 
+                "stage3_max_reuse_distance": 2e7, 
+                "stage3_gather_fp16_weights_on_model_save": True,
+                "allgather_partitions": True,
+                "allgather_bucket_size": 2e7,
+                "reduce_scatter": True
+            },
+            "optimizer": {
+                "type": "AdamW",
+                "params": {
+                    "lr": "auto",
+                    "betas": [0.9, 0.999],
+                    "eps": 1e-8,
+                    "weight_decay": 0.01
+                }
+            },
+            "scheduler": {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": 3e-6,
+                    "warmup_max_lr": 2e-5,
+                    "warmup_num_steps": 100
+                }
+            },
+            "steps_per_print": float("inf"),  # this will stop deepspeed from logging @ stdout
+        }
+
+        self.fp16 = True # self.ds_config['fp16']['enabled']
