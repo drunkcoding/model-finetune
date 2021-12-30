@@ -19,6 +19,7 @@ import math
 import os
 import random
 from pathlib import Path
+from typing import OrderedDict
 from datasets.features.features import Value
 import numpy as np
 
@@ -28,6 +29,7 @@ import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import shutil
 
 import transformers
 from accelerate import Accelerator, DeepSpeedPlugin
@@ -45,14 +47,112 @@ from transformers import (
     set_seed,
 )
 from transformers.file_utils import get_full_repo_name
+from transformers.tokenization_utils_base import BatchEncoding
 from transformers.utils.dummy_sentencepiece_objects import T5Tokenizer
 from transformers.utils.versions import require_version
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 
 import deepspeed
 
-from helpers import DeepSpeedPluginComplete, get_optimizer_grouped_parameters
-from t5train.utils import label2text
+task_to_labels = {
+    "cola": ("not_acceptable", "acceptable"),
+    # "mnli": None,
+    "mrpc": ("not_equivalent", "equivalent"),
+    "qnli": ("entailment", "not_entailment"),
+    "qqp": ("not_duplicate", "duplicate"),
+    # "rte": ("entailment", "not_entailment"),
+    "rte": ("true", "false"),
+    "sst2": ("negative", "positive"),
+    # "stsb": ("sentence1", "sentence2"),
+    # "wnli": ("sentence1", "sentence2"),
+}
+
+def label2text(task_name, label):
+    if task_to_labels[task_name] is None:
+        return label
+    else:
+        return task_to_labels[task_name][label]
+
+
+def get_optimizer_grouped_parameters(args, model):
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    return optimizer_grouped_parameters
+
+from dataclasses import dataclass
+from accelerate import DeepSpeedPlugin
+import os
+
+@dataclass
+class DeepSpeedPluginComplete(DeepSpeedPlugin):
+
+    def __post_init__(self):
+
+        if self.gradient_accumulation_steps is None:
+            self.gradient_accumulation_steps = int(os.environ.get("GRADIENT_ACCUMULATION_STEPS", 1))
+
+        if self.zero_stage is None:
+            self.zero_stage = int(os.environ.get("DEEPSPEED_ZERO_STAGE", 2))
+
+        if self.offload_optimizer_device is None:
+            self.offload_optimizer_device = os.environ.get("DEEPSPEED_OFFLOAD_OPTIMIZER_DEVICE", "none")
+
+        self.deepspeed_config = self.ds_config = {
+            "train_batch_size": None,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "zero_optimization": {
+                "stage": self.zero_stage,
+                "offload_optimizer": {
+                    "device": self.offload_optimizer_device,
+                },
+                "offload_param": {
+                    "device": "cpu", 
+                    "pin_memory": True
+                }, 
+                "overlap_comm": True, 
+                "contiguous_gradients": True, 
+                "sub_group_size": 2e7, 
+                "reduce_bucket_size": 2e7, 
+                "stage3_prefetch_bucket_size": 2e7, 
+                "stage3_param_persistence_threshold": 2e7, 
+                "stage3_max_live_parameters": 2e7, 
+                "stage3_max_reuse_distance": 2e7, 
+                "stage3_gather_fp16_weights_on_model_save": True,
+                "allgather_partitions": True,
+                "allgather_bucket_size": 2e7,
+                "reduce_scatter": True
+            },
+            "optimizer": {
+                "type": "AdamW",
+                "params": {
+                    "lr": "auto",
+                    "betas": [0.9, 0.999],
+                    "eps": 1e-8,
+                    "weight_decay": 0.01
+                }
+            },
+            "scheduler": {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": 3e-6,
+                    "warmup_max_lr": 2e-5,
+                    "warmup_num_steps": 100
+                }
+            },
+            "steps_per_print": float("inf"),  # this will stop deepspeed from logging @ stdout
+        }
+
+        self.fp16 = True # self.ds_config['fp16']['enabled']
 
 logger = logging.getLogger(__name__)
 
@@ -193,16 +293,16 @@ def main():
     args = parse_args()
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    deepspeed_plugin = DeepSpeedPluginComplete(zero_stage=2, auto_opt_mapping=True, offload_optimizer_device="cpu", gradient_accumulation_steps=2)
-    accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-    # accelerator = Accelerator()
+    # deepspeed_plugin = DeepSpeedPluginComplete(zero_stage=0, auto_opt_mapping=True, offload_optimizer_device="cpu", gradient_accumulation_steps=args.gradient_accumulation_steps)
+    # accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+    accelerator = Accelerator()
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    logger.info(accelerator.state)
+    # logger.info(accelerator.state)
 
     # Setup logging, we only want one process per machine to log things on the screen.
     # accelerator.is_local_main_process is only True for one process per machine.
@@ -468,11 +568,22 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
 
+    vocab = tokenizer.get_vocab()
+    pos_token = tokenizer(task_to_labels[args.task_name][1]).input_ids[0]
+    neg_token = tokenizer(task_to_labels[args.task_name][0]).input_ids[0]
     
+    if accelerator.is_main_process:
+        print("+++++++++++++++++++++++++++")
+        print(pos_token, task_to_labels[args.task_name])
+
+    model_list = OrderedDict()
 
     for epoch in range(args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
+            # batch = BatchEncoding(batch).to(torch.long)
+            # print(tokenizer.decode(batch['input_ids'][0]))
+            # print(tokenizer.decode(batch['labels'][0]))
             outputs = model(**batch)
             loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
@@ -487,46 +598,72 @@ def main():
             if completed_steps >= args.max_train_steps:
                 break
 
-        model.eval()
-        eval_loss = []
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            loss = outputs.loss.detach().cpu().item()
-            # print(loss)
-            pooled_logits = outputs.logits[:, 0, [1176, 6136]] # 'true' for 0; 'false' for 1
-            # print(outputs.keys())
-            # print(outputs.logits.size())
-            predictions = pooled_logits.argmax(dim=-1)
-            
-            # predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-            predictions=accelerator.gather(predictions).detach().cpu()
-            references=accelerator.gather(batch["labels"]).detach().cpu()
-            references = references[:, 0] != 1176
-            # print(predictions,references)
-            metric.add_batch(
-                predictions=predictions,
-                references=references,
-            )
-            eval_loss.append(loss)
+            if completed_steps % 50 == 0:
+                eval_loss = []
+                
+                with torch.no_grad():
+                    for step, batch in enumerate(eval_dataloader):
+                        outputs = model(**batch)
+                        loss = outputs.loss.detach().cpu().item()
+                        # pooled_logits = outputs.logits[:, 0, pos_token] # 'true' for 0; 'false' for 1
+                        # logger.info("outputs.logits %s", outputs.logits.size())
+                        predictions = outputs.logits[:, 0, [pos_token,neg_token]].argmax(dim=-1) == pos_token
+                        
+                        # predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+                        predictions=accelerator.gather(predictions).detach().cpu()
+                        references=accelerator.gather(batch["labels"]).detach().cpu()
+                        references[references < 0] = 0
+                        print("predict_ids %s ,reference_ids %s" % (
+                            # tokenizer.decode(outputs.logits[:, 1, :].argmax(dim=-1).detach().cpu()[0]),
+                            outputs.logits.argmax(dim=-1).detach().cpu()[0].to(torch.long),
+                            references[0].to(torch.long),
+                            )
+                        )
 
-        eval_metric = metric.compute()
-        logger.info(f"epoch {epoch}: {eval_metric}, loss: {np.mean(eval_loss)}")
+                        print("predict %s, reference %s" % (
+                            # tokenizer.decode(outputs.logits[:, 1, :].argmax(dim=-1).detach().cpu()[0]),
+                            tokenizer.decode(outputs.logits.argmax(dim=-1).detach().cpu()[0].to(torch.long)),
+                            tokenizer.decode(references[0].to(torch.long)),
+                            )
+                        )
 
-        # if args.push_to_hub and epoch < args.num_train_epochs - 1:
-        epoch_dir = os.path.join(args.output_dir, f"epoch-{epoch}")
-        os.makedirs(epoch_dir, exist_ok=True)
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(epoch_dir, save_function=accelerator.save)
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(epoch_dir)
+                        # print(outputs.logits.argmax(dim=-1), references)
 
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
+                        references = references[:, 0] == pos_token
+                        # print(predictions,references)
+                        
+                        metric.add_batch(
+                            predictions=predictions,
+                            references=references,
+                        )
+                        eval_loss.append(loss)
+
+                    eval_metric = metric.compute()
+                    logger.info(f"epoch {epoch}: {eval_metric}, loss: {np.mean(eval_loss)}")
+
+                    # if args.push_to_hub and epoch < args.num_train_epochs - 1:
+                    epoch_dir = os.path.join(args.output_dir, f"step-{completed_steps}")
+                    model_list[np.mean(eval_loss)] = epoch_dir
+
+                    if len(model_list.keys()) > 10:
+                        dir = model_list.popitem(last=True)[1]
+                        shutil.rmtree(dir, ignore_errors=True)
+
+                    if epoch_dir in model_list.values() and accelerator.is_main_process:
+                        os.makedirs(epoch_dir, exist_ok=True)
+                        accelerator.wait_for_everyone()
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        unwrapped_model.save_pretrained(epoch_dir, save_function=accelerator.save)
+                        # if accelerator.is_main_process:
+                        tokenizer.save_pretrained(epoch_dir)
+
+                # model.train()
+    # if args.output_dir is not None:
+    #     accelerator.wait_for_everyone()
+    #     unwrapped_model = accelerator.unwrap_model(model)
+    #     unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+    #     if accelerator.is_main_process:
+    #         tokenizer.save_pretrained(args.output_dir)
 
     if args.task_name == "mnli":
         # Final evaluation on mismatched validation set

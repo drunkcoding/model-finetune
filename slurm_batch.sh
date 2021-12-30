@@ -18,8 +18,7 @@
 #SBATCH --mail-type=ALL
 #SBATCH --gres=gpu:8
 #SBATCH --partition=big
-#SBATCH --mem=64000
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=40
 
 # ====================
 # Options for sbatch
@@ -72,14 +71,15 @@ set -e
 #source /etc/profile.d/modules.sh
 #module load cuda
 
-MODULE="gpt2"
-LR=3e-5
-TASK="QQP"
+MODULE="t5-base-lm-adapt"
+LR=6e-5
+TASK="rte"
 
 echo "Job running ${MODULE}, ${LR}, ${TASK}"
 
-bash run_glue.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
-# bash run_glue.sh MNLI gpt-neo-2.7B 2e-5 ${HOME}/HuggingFace
+bash t5train/run_glue_no_trainer.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
+# bash run_glue.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
+# bash run_glue.sh RTE gpt-neo-2.7B 2e-5 ${HOME}/HuggingFace
 # bash run_glue_no_trainer_pp.sh CoLA gpt-j-6B 2e-5 ${HOME}/HuggingFace
 # bash run_glue_no_trainer_ds.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
 

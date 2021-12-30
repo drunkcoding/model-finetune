@@ -27,12 +27,17 @@ import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
 
+import warnings
+import torch
+warnings.filterwarnings("ignore")
+
 import transformers
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
+    DataCollatorForSeq2Seq,
     EvalPrediction,
     HfArgumentParser,
     PretrainedConfig,
@@ -47,10 +52,52 @@ from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 
-from t5train.utils import label2text
+task_to_labels = {
+    # "cola": ("not_acceptable", "acceptable"),
+    "cola": ("true", "false"),
+    "mnli": None,
+    "mrpc": ("true", "false"),
+    "qnli": ("true", "false"),
+    "qqp": ("true", "false"),
+    "axb": ("true", "false"),
+    "axg": ("true", "false"),
+    "boolq": ("true", "false"),
+    "cb": ("true", "false", "not"),
+    # "rte": ("entailment", "not_entailment"),
+    "rte": ("true", "false"),
+    "sst2": ("true", "false"),
+    # "stsb": ("sentence1", "sentence2"),
+    # "wnli": ("sentence1", "sentence2"),
+}
+
+def label2text(task_name, label):
+    # easy_labels = ("true", "false")
+    # return easy_labels[label]
+    if task_to_labels[task_name] is None:
+        return label
+    else:
+        return task_to_labels[task_name][label]
+        # return easy_labels[label]
+
+
+def get_optimizer_grouped_parameters(args, model):
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    return optimizer_grouped_parameters
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 os.environ['TORCH_EXTENSIONS_DIR'] = os.getcwd()
+# os.environ['NCCL_DEBUG'] = "INFO"
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.13.0.dev0")
@@ -67,9 +114,14 @@ task_to_keys = {
     "sst2": ("sentence", None),
     "stsb": ("sentence1", "sentence2"),
     "wnli": ("sentence1", "sentence2"),
+    "axb": ("sentence1", "sentence2"),
+    "axg": ("premise", "hypothesis"),
+    "boolq": ("question", "passage"),
+    "cb": ("premise", "hypothesis"),
 }
 
 logger = logging.getLogger(__name__)
+
 
 
 @dataclass
@@ -244,55 +296,11 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
-    # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use as labels the column called 'label' and as pair of sentences the
-    # sentences in columns called 'sentence1' and 'sentence2' if such column exists or the first two columns not named
-    # label if at least two columns are provided.
-    #
-    # If the CSVs/JSONs contain only one non-label column, the script does single sentence classification on this
-    # single column. You can easily tweak this behavior (see below)
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    if data_args.task_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset("glue", data_args.task_name, cache_dir=model_args.cache_dir)
-    elif data_args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir
-        )
-    else:
-        # Loading a dataset from your local files.
-        # CSV/JSON training and evaluation files are needed.
-        data_files = {"train": data_args.train_file, "validation": data_args.validation_file}
-
-        # Get the test dataset: you can provide your own CSV/JSON test file (see below)
-        # when you use `do_predict` without specifying a GLUE benchmark task.
-        if training_args.do_predict:
-            if data_args.test_file is not None:
-                train_extension = data_args.train_file.split(".")[-1]
-                test_extension = data_args.test_file.split(".")[-1]
-                assert (
-                    test_extension == train_extension
-                ), "`test_file` should have the same extension (csv or json) as `train_file`."
-                data_files["test"] = data_args.test_file
-            else:
-                raise ValueError("Need either a GLUE task or a test file for `do_predict`.")
-
-        for key in data_files.keys():
-            logger.info(f"load a local file for {key}: {data_files[key]}")
-
-        if data_args.train_file.endswith(".csv"):
-            # Loading a dataset from local csv files
-            raw_datasets = load_dataset("csv", data_files=data_files, cache_dir=model_args.cache_dir)
-        else:
-            # Loading a dataset from local json files
-            raw_datasets = load_dataset("json", data_files=data_files, cache_dir=model_args.cache_dir)
-    # See more about loading any type of standard or custom dataset at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
+    print(data_args.dataset_name, data_args.task_name)
+    raw_datasets = load_dataset(
+        data_args.dataset_name, data_args.task_name, cache_dir=model_args.cache_dir
+    )
+    print(raw_datasets)
 
     # Labels
     if data_args.task_name is not None:
@@ -320,7 +328,7 @@ def main():
     # download model & vocab.
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        num_labels=num_labels,
+        # num_labels=num_labels,
         finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
@@ -433,7 +441,7 @@ def main():
 
             # Setup the tokenizer for targets
             with tokenizer.as_target_tokenizer():
-                labels = tokenizer(labels, max_length=5, padding=padding, truncation=True, return_tensors="np")
+                labels = tokenizer(labels, max_length=2, padding=padding, truncation=True, return_tensors="np")
 
             # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
             # padding in the loss.
@@ -442,7 +450,7 @@ def main():
                     [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
                 ]
 
-            result["label"] = labels["input_ids"]
+            result["labels"] = labels["input_ids"]
 
         return result
 
@@ -480,30 +488,66 @@ def main():
         for index in random.sample(range(len(train_dataset)), 3):
             logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
-    # Get the metric function
-    if data_args.task_name is not None:
-        metric = load_metric("glue", data_args.task_name)
-    else:
-        metric = load_metric("accuracy")
+    metric = load_metric(data_args.dataset_name, data_args.task_name)
 
+    # if data_args.task_name == "cola":
+    #     training_args.metric_for_best_model = "matthews_correlation"
+    # else:
+    #     training_args.metric_for_best_model = "accuracy"
+    # training_args.greater_is_better = True
+
+    vocab = tokenizer.get_vocab()
+    # print(vocab)
+    pos_token = tokenizer(task_to_labels[data_args.task_name][1]).input_ids[0]
+    neg_token = tokenizer(task_to_labels[data_args.task_name][0]).input_ids[0]
+
+    # print(pos_token, neg_token)
+    # exit()
     # You can define your custom compute_metrics function. It takes an `EvalPrediction` object (a namedtuple with a
     # predictions and label_ids field) and has to return a dictionary string to float.
     def compute_metrics(p: EvalPrediction):
         preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
-        preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
+        # print(preds.shape, p.label_ids.shape)
+        preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=-1)
+
+        # for i in range(len(preds)):
+        #     pred_sample = preds[i].astype(int)
+        #     ref_sample = p.label_ids[i].astype(int)
+        #     ref_sample[ref_sample < 0] = 0
+        #     print("predict %s, reference %s" % (
+        #         tokenizer.decode(pred_sample),
+        #         tokenizer.decode(ref_sample),
+        #         )
+        #     )
+        preds = preds[:, 0] == pos_token
+        label_ids = p.label_ids[:, 0] == pos_token
+
+        # print(preds, label_ids, pos_token)
+
         if data_args.task_name is not None:
-            result = metric.compute(predictions=preds, references=p.label_ids)
+            result = metric.compute(predictions=preds, references=label_ids)
             if len(result) > 1:
                 result["combined_score"] = np.mean(list(result.values())).item()
             return result
         elif is_regression:
-            return {"mse": ((preds - p.label_ids) ** 2).mean().item()}
+            return {"mse": ((preds - label_ids) ** 2).mean().item()}
         else:
-            return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
+            return {"accuracy": (preds == label_ids).astype(np.float32).mean().item()}
+
+        # if data_args.task_name is not None:
+        #     result = metric.compute(predictions=preds, references=p.label_ids)
+        #     if len(result) > 1:
+        #         result["combined_score"] = np.mean(list(result.values())).item()
+        #     return result
+        # elif is_regression:
+        #     return {"mse": ((preds - p.label_ids) ** 2).mean().item()}
+        # else:
+        #     return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
 
     # Data collator will default to DataCollatorWithPadding, so we change it if we already did the padding.
     if data_args.pad_to_max_length:
-        data_collator = default_data_collator
+        # data_collator = default_data_collator
+        data_collator = DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8)
     elif training_args.fp16:
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
     else:

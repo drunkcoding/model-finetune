@@ -16,9 +16,10 @@
 
 #SBATCH --mail-user=leyang.xue@ed.ac.uk
 #SBATCH --mail-type=ALL
-#SBATCH --gres=gpu:8
-#SBATCH --mincpus=30
+#SBATCH --gres=gpu:4
 #SBATCH --partition=big
+#SBATCH --mem=100000
+#SBATCH --cpus-per-task=20
 
 # ====================
 # Options for sbatch
@@ -57,54 +58,37 @@ source ~/.bashrc
 # Make script bail out after first error
 set -e
 
-task_name=$1
-model_name=$2
-base_dir=$4
-batch_size=2
-learning_rate=$3
+# ==============================
+# Finally, run the experiment!
+# ==============================
+# Read line number ${SLURM_ARRAY_TASK_ID} from the experiment file and run it
+# ${SLURM_ARRAY_TASK_ID} is simply the number of the job within the array. If
+# you execute `sbatch --array=1:100 ...` the jobs will get numbers 1 to 100
+# inclusive.
 
-mkdir -p ./outputs/${model_name}/${task_name}/
-mkdir -p ./log/${model_name}/${task_name}/
+# experiment_text_file=$1
+# COMMAND="`sed \"${SLURM_ARRAY_TASK_ID}q;d\" ${experiment_text_file}`"
 
-# accelerate launch t5train/run_glue_no_trainer_seq2seq.py \
-#     --model_name_or_path  ${base_dir}/${model_name} \
-#     --task_name ${task_name} \
-#     --max_length 512 \
-#     --per_device_train_batch_size ${batch_size} \
-#     --learning_rate ${learning_rate} \
-#     --num_train_epochs 10 \
-#     --weight_decay 0.01 \
-#     --pad_to_max_length \
-#     --gradient_accumulation_steps 4 \
-#     --output_dir ./outputs/${model_name}/${task_name}/ &> ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log
+#source /etc/profile.d/modules.sh
+#module load cuda
 
-#     
-# python t5train/run_glue_deepspeed_seq2seq.py \
-deepspeed t5train/run_glue_deepspeed_seq2seq.py \
-    --deepspeed deepspeed_cfg_auto.json \
-    --model_name_or_path  ${base_dir}/${model_name} \
-    --task_name ${task_name} \
-    --dataset_name glue \
-    --max_seq_length 128 \
-    --do_train \
-    --do_eval \
-    --per_device_train_batch_size ${batch_size} \
-    --learning_rate ${learning_rate} \
-    --num_train_epochs 10 \
-    --save_strategy steps \
-    --logging_strategy steps \
-    --load_best_model_at_end \
-    --evaluation_strategy steps \
-    --save_steps 40 \
-    --gradient_accumulation_steps 8 \
-    --logging_steps 40 \
-    --save_total_limit 5 \
-    --warmup_steps 100 \
-    --weight_decay 0.01 \
-    --overwrite_output_dir \
-    --output_dir ./outputs/${model_name}/${task_name}/ \
-    &> ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log
+MODULE="t5-large-lm-adapt"
+LR=6e-5
+TASK="SST2"
 
+echo "Job running ${MODULE}, ${LR}, ${TASK}"
+
+# TASKS=( "QQP" "QNLI" "MRPC" "MNLI" )
+
+# for task in "${TASKS[@]}"; do
+#    bash t5train/run_glue_no_trainer.sh ${task} ${MODULE} ${LR} ${HOME}/HuggingFace
+# done
+
+bash t5train/run_glue_no_trainer.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
+# bash run_glue.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
+# bash run_glue.sh RTE gpt-neo-2.7B 2e-5 ${HOME}/HuggingFace
+# bash run_glue_no_trainer_pp.sh CoLA gpt-j-6B 2e-5 ${HOME}/HuggingFace
+# bash run_glue_no_trainer_ds.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
 
 # =========================
 # Post experiment logging
@@ -114,4 +98,3 @@ echo "============"
 echo "job finished successfully"
 dt=$(date '+%d/%m/%Y %H:%M:%S')
 echo "Job finished: $dt"
-

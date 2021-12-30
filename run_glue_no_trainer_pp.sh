@@ -67,7 +67,7 @@ mkdir -p ./outputs/${model_name}/${task_name}/
 mkdir -p ./log/${model_name}/${task_name}/
 
 python run_glue_no_trainer_pp.py \
-    --model_name_or_path ${base_dir}/${model_name} \
+    --model_name_or_path ${base_dir} \
     --task_name ${task_name} \
     --pad_to_max_length \
     --max_length 128 \
