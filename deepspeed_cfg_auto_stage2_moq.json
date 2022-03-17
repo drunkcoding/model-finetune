@@ -13,10 +13,6 @@
     "contiguous_gradients": true, 
     "sub_group_size": 1e7, 
     "reduce_bucket_size": 1e7, 
-    "stage3_prefetch_bucket_size": 1e7, 
-    "stage3_param_persistence_threshold": 1e7, 
-    "stage3_max_live_parameters": 1e7, 
-    "stage3_max_reuse_distance": 1e7, 
     "allgather_partitions": true,
     "allgather_bucket_size": 1e7,
     "reduce_scatter": true
@@ -36,6 +32,25 @@
         "warmup_min_lr": 3e-6,
         "warmup_max_lr": "auto",
         "warmup_num_steps": 100
+    }
+  },
+  "quantize_training": {
+    "enabled": true,
+    "quantize_verbose": true,
+    "quantizer_kernel": true,
+    "quantize_type": "symmetric",
+    "quantize_bits": {
+      "start_bits": 12,
+      "target_bits": 8
+    },
+    "quantize_schedule": {
+      "quantize_period": 10,
+      "schedule_offset": 0
+    },
+    "quantize_groups": 8,
+    "fp16_mixed_quantize": {
+      "enabled": true,
+      "quantize_change_ratio": 0.001
     }
   },
   "gradient_accumulation_steps": "auto",

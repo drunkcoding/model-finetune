@@ -22,7 +22,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import datasets
 from datasets.arrow_dataset import concatenate_datasets
@@ -32,6 +32,7 @@ import datasets
 
 import warnings
 import torch
+from torch import nn
 warnings.filterwarnings("ignore")
 
 import transformers
@@ -59,14 +60,13 @@ from hfutils.arg_parser import HfArguments
 from hfutils.constants import TASK_TO_KEYS, TASK_TO_LABELS
 
 def label2text(task_name, label):
-    # easy_labels = ("true", "false")
-    # return easy_labels[label]
     if TASK_TO_LABELS[task_name] is None:
         return label
     else:
         return TASK_TO_LABELS[task_name][label]
-        # return easy_labels[label]
 
+def token2label(tokens, label_tokens: List):
+    return [label_tokens.index(t) for t in tokens]
 
 def get_optimizer_grouped_parameters(args, model):
     no_decay = ["bias", "LayerNorm.weight"]
@@ -94,6 +94,8 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text
 
 logger = logging.getLogger(__name__)
 
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 @dataclass
@@ -303,8 +305,6 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
-    print(model)
-
     # if tokenizer.pad_token is None:
     #     tokenizer.pad_token = tokenizer.eos_token
     #     model.config.pad_token_id = model.config.eos_token_id
@@ -322,6 +322,16 @@ def main():
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+
+    # Data collator will default to DataCollatorWithPadding, so we change it if we already did the padding.
+    if data_args.pad_to_max_length:
+        # data_collator = default_data_collator
+        data_collator = DataCollatorForSeq2Seq(tokenizer)
+    elif training_args.fp16:
+        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
+    else:
+        data_collator = None
+
 
     def preprocess_function(examples, task_name):
         # Tokenize the texts
@@ -368,165 +378,89 @@ def main():
         # del result['label']
         return result
 
-    with training_args.main_process_first(desc="dataset map pre-processing"):
-        raw_datasets = None
-        for task_key in TASK_TO_LABELS.keys():
-            dataset = load_dataset(
-                data_args.dataset_name, task_key, cache_dir=model_args.cache_dir
-            )
-            print(data_args.dataset_name, task_key, dataset)
-            dataset = dataset.map(
-                partial(preprocess_function, task_name=task_key),
-                batched=True,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on dataset",
-                remove_columns=["idx", "label"] + list(TASK_TO_KEYS[task_key])
-            )
-            # if data_args.max_eval_samples is not None and len(dataset['validation']) > data_args.max_eval_samples:
-            # dataset['validation'] = dataset['validation'].shuffle().select(range(data_args.max_eval_samples))
-            if data_args.max_train_samples is not None and len(dataset['train']) > data_args.max_train_samples:
-                
-                dataset['train'] = dataset['train'].shuffle().select(range(data_args.max_train_samples))
-
-            if raw_datasets is None:
-                raw_datasets = dataset
-            else:
-                raw_datasets['train'] = concatenate_datasets(
-                    [raw_datasets['train']] 
-                    + [dataset['train']] 
-                    * int(np.ceil(max(10000 / len(dataset['train']), 1)))
-                )
-                # raw_datasets['validation'] = concatenate_datasets([raw_datasets['validation'], dataset['validation']])
-                # raw_datasets['test'] = concatenate_datasets([raw_datasets['test'], dataset['test']])
-        print("raw_datasets", raw_datasets)
-    if training_args.do_train:
-        if "train" not in raw_datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = raw_datasets["train"].shuffle()
-        print(train_dataset)
-        # if data_args.max_train_samples is not None:
-        #     train_dataset = train_dataset.shuffle().select(range(data_args.max_train_samples))
-
-    # if training_args.do_eval:
-    #     if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
-    #         raise ValueError("--do_eval requires a validation dataset")
-    #     eval_dataset = raw_datasets["validation_matched" if data_args.task_name == "mnli" else "validation"].shuffle()
-    #     # if data_args.max_eval_samples is not None:
-    #     #     eval_dataset = eval_dataset.shuffle().select(range(data_args.max_eval_samples))
-
-    # if training_args.do_predict or data_args.task_name is not None or data_args.test_file is not None:
-    #     if "test" not in raw_datasets and "test_matched" not in raw_datasets:
-    #         raise ValueError("--do_predict requires a test dataset")
-    #     predict_dataset = raw_datasets["test_matched" if data_args.task_name == "mnli" else "test"].shuffle()
-    #     if data_args.max_predict_samples is not None:
-    #         predict_dataset = predict_dataset.shuffle().select(range(data_args.max_predict_samples))
-
-    # Log a few random samples from the training set:
-    if training_args.do_train:
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-
-    # metric = load_metric(data_args.dataset_name, data_args.task_name)
-
-    print("raw_datasets", raw_datasets)
-    print("train_dataset", train_dataset)
-    # print("eval_dataset", eval_dataset)
-  
-    # Data collator will default to DataCollatorWithPadding, so we change it if we already did the padding.
-    if data_args.pad_to_max_length:
-        # data_collator = default_data_collator
-        data_collator = DataCollatorForSeq2Seq(tokenizer)
-    elif training_args.fp16:
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
-    else:
-        data_collator = None
-
-    # Initialize our Trainer
-    # model.parallelize()
-    trainer = Seq2SeqTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        # eval_dataset=eval_dataset if training_args.do_eval else None,
-        # compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
-
-    # Training
-    if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        metrics = train_result.metrics
-        max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+    all_acc = []
+    all_loss = []
+    for task_key in TASK_TO_LABELS.keys():
+        loss = nn.CrossEntropyLoss()
+        dataset = load_dataset(
+            data_args.dataset_name, task_key, cache_dir=model_args.cache_dir
         )
-        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+        print(data_args.dataset_name, task_key, dataset)
+        dataset = dataset.map(
+            partial(preprocess_function, task_name=task_key),
+            batched=True,
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc="Running tokenizer on dataset",
+            remove_columns=["idx", "label"] + list(TASK_TO_KEYS[task_key])
+        )
+        eval_name = "validation_matched" if task_key == "mnli" else "validation"
+        eval_dataset = dataset[eval_name]
 
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+        # Log a few random samples from the training set:
+        for index in random.sample(range(len(eval_dataset)), 3):
+            logger.info(f"Sample {index} of the training set: {eval_dataset[index]}.")
 
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
+        metric = load_metric("accuracy")
 
-    # # Evaluation
-    # if training_args.do_eval:
-    #     logger.info("*** Evaluate ***")
-
-    #     # Loop to handle MNLI double evaluation (matched, mis-matched)
-    #     tasks = [data_args.task_name]
-    #     eval_datasets = [eval_dataset]
-    #     if data_args.task_name == "mnli":
-    #         tasks.append("mnli-mm")
-    #         eval_datasets.append(raw_datasets["validation_mismatched"])
-
-    #     for eval_dataset, task in zip(eval_datasets, tasks):
-    #         metrics = trainer.evaluate(eval_dataset=eval_dataset)
-
-    #         max_eval_samples = (
-    #             data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-    #         )
-    #         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
-
-    #         trainer.log_metrics("eval", metrics)
-    #         trainer.save_metrics("eval", metrics)
-
-    # if training_args.do_predict:
-    #     logger.info("*** Predict ***")
-
-    #     # Loop to handle MNLI double evaluation (matched, mis-matched)
-    #     tasks = [data_args.task_name]
-    #     predict_datasets = [predict_dataset]
-    #     if data_args.task_name == "mnli":
-    #         tasks.append("mnli-mm")
-    #         predict_datasets.append(raw_datasets["test_mismatched"])
-
-    #     for predict_dataset, task in zip(predict_datasets, tasks):
-    #         # Removing the `label` columns because it contains -1 and Trainer won't like that.
-    #         predict_dataset = predict_dataset.remove_columns("label")
-    #         predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
-    #         predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
-
-    #         output_predict_file = os.path.join(training_args.output_dir, f"predict_results_{task}.txt")
-    #         if trainer.is_world_process_zero():
-    #             with open(output_predict_file, "w") as writer:
-    #                 logger.info(f"***** Predict results {task} *****")
-    #                 writer.write("index\tprediction\n")
-    #                 for index, item in enumerate(predictions):
-    #                     if is_regression:
-    #                         writer.write(f"{index}\t{item:3.3f}\n")
-    #                     else:
-    #                         item = label_list[item]
-    #                         writer.write(f"{index}\t{item}\n")
+        print("eval_dataset", eval_dataset)
+    
 
 
-def _mp_fn(index):
-    # For xla_spawn (TPUs)
-    main()
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=64,
+            collate_fn=data_collator,
+        )
+
+        label_tokens = [
+            tokenizer(label, max_length=2).input_ids[0]
+            for label in TASK_TO_LABELS['mnli']
+            if label is not None
+        ]
+
+        model = model.to("cuda")
+
+        logits_list = []
+        labels_list = []
+        for batch in tqdm(eval_dataloader, desc=task_key):
+            input_ids = batch['input_ids'].to("cuda")
+            attention_mask = batch['attention_mask'].to("cuda")
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                do_sample=False,  # disable sampling to test if batching affects output
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
+            logits = outputs.scores[0][:, label_tokens]
+            predictions = np.argmax(logits.detach().cpu(), axis=-1)
+            labels = token2label(batch['labels'][:, 0].flatten(), label_tokens)
+
+            # print(predictions, labels)
+
+            metric.add_batch(
+                predictions=predictions,
+                references=labels
+            )
+            logits_list.append(logits.detach().cpu())
+            labels_list += labels
+
+        labels = torch.Tensor(labels_list).flatten().long()
+        logits = torch.cat(logits_list, dim=0)
+
+
+        eval_result = metric.compute()
+        eval_loss = loss(logits, labels)
+
+        print(labels.shape, logits.shape)
+        print(task_key, eval_result, eval_loss)
+
+        all_acc.append(eval_result['accuracy'])
+        all_loss.append(eval_loss.item())
+    
+    import scipy.stats as stats
+    print("accuracy",stats.describe(all_acc))
+    print("loss",stats.describe(all_loss))
 
 
 if __name__ == "__main__":

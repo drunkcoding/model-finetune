@@ -55,7 +55,7 @@ from transformers import T5Tokenizer, T5ForConditionalGeneration
 task_to_labels = {
     # "cola": ("not_acceptable", "acceptable"),
     "cola": ("true", "false"),
-    "mnli": None,
+    "mnli": ("true", "false", "not"),
     "mrpc": ("true", "false"),
     "qnli": ("true", "false"),
     "qqp": ("true", "false"),
@@ -285,9 +285,7 @@ def main():
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
             raise ValueError(
                 f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+                "Use --owoint is not None and training_args.resume_from_checkpoint is None:
             logger.info(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
@@ -328,7 +326,8 @@ def main():
     # download model & vocab.
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        # num_labels=num_labels,
+        num_labels=num_labels,
+       	local_files_only=True,
         finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
@@ -337,6 +336,7 @@ def main():
     tokenizer = T5Tokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
+       	local_files_only=True,
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
@@ -347,6 +347,7 @@ def main():
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
+       	local_files_only=True,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
@@ -355,6 +356,12 @@ def main():
     # if tokenizer.pad_token is None:
     #     tokenizer.pad_token = tokenizer.eos_token
     #     model.config.pad_token_id = model.config.eos_token_id
+
+    label_tokens = [
+        tokenizer(label, max_length=2).input_ids[0]
+        for label in task_to_labels[data_args.task_name]
+        if label is not None
+    ]
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -451,7 +458,7 @@ def main():
                 ]
 
             result["labels"] = labels["input_ids"]
-
+            # del result['label']
         return result
 
     with training_args.main_process_first(desc="dataset map pre-processing"):
@@ -468,13 +475,17 @@ def main():
         print(train_dataset)
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
+        
+        train_dataset = train_dataset.remove_columns("label")
 
     if training_args.do_eval:
         if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = raw_datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
-        if data_args.max_eval_samples is not None:
-            eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
+        if data_args.max_eval_samples is not None and len(eval_dataset) > data_args.max_eval_samples:
+            eval_dataset = eval_dataset.shuffle().select(range(data_args.max_eval_samples))
+
+        eval_dataset = eval_dataset.remove_columns("label")
 
     if training_args.do_predict or data_args.task_name is not None or data_args.test_file is not None:
         if "test" not in raw_datasets and "test_matched" not in raw_datasets:
@@ -482,6 +493,7 @@ def main():
         predict_dataset = raw_datasets["test_matched" if data_args.task_name == "mnli" else "test"]
         if data_args.max_predict_samples is not None:
             predict_dataset = predict_dataset.select(range(data_args.max_predict_samples))
+    
 
     # Log a few random samples from the training set:
     if training_args.do_train:
@@ -498,8 +510,8 @@ def main():
 
     vocab = tokenizer.get_vocab()
     # print(vocab)
-    pos_token = tokenizer(task_to_labels[data_args.task_name][1]).input_ids[0]
-    neg_token = tokenizer(task_to_labels[data_args.task_name][0]).input_ids[0]
+    # pos_token = tokenizer(task_to_labels[data_args.task_name][1]).input_ids[0]
+    # neg_token = tokenizer(task_to_labels[data_args.task_name][0]).input_ids[0]
 
     # print(pos_token, neg_token)
     # exit()
@@ -519,8 +531,11 @@ def main():
         #         tokenizer.decode(ref_sample),
         #         )
         #     )
-        preds = preds[:, 0] == pos_token
-        label_ids = p.label_ids[:, 0] == pos_token
+        # preds = preds[:, 0] == pos_token
+        # label_ids = p.label_ids[:, 0] == pos_token
+
+        preds = [label_tokens.index(p) for p in preds[:, 0]] 
+        label_ids = [label_tokens.index(p) for p in p.label_ids[:, 0]] 
 
         # print(preds, label_ids, pos_token)
 
@@ -635,17 +650,17 @@ def main():
                             item = label_list[item]
                             writer.write(f"{index}\t{item}\n")
 
-    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-classification"}
-    if data_args.task_name is not None:
-        kwargs["language"] = "en"
-        kwargs["dataset_tags"] = "glue"
-        kwargs["dataset_args"] = data_args.task_name
-        kwargs["dataset"] = f"GLUE {data_args.task_name.upper()}"
+    # kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-classification"}
+    # if data_args.task_name is not None:
+    #     kwargs["language"] = "en"
+    #     kwargs["dataset_tags"] = "glue"
+    #     kwargs["dataset_args"] = data_args.task_name
+    #     kwargs["dataset"] = f"GLUE {data_args.task_name.upper()}"
 
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
-    else:
-        trainer.create_model_card(**kwargs)
+    # if training_args.push_to_hub:
+    #     trainer.push_to_hub(**kwargs)
+    # else:
+    #     trainer.create_model_card(**kwargs)
 
 
 def _mp_fn(index):

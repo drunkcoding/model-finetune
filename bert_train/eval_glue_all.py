@@ -22,7 +22,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import datasets
 from datasets.arrow_dataset import concatenate_datasets
@@ -32,6 +32,7 @@ import datasets
 
 import warnings
 import torch
+from torch import nn
 warnings.filterwarnings("ignore")
 
 import transformers
@@ -59,14 +60,13 @@ from hfutils.arg_parser import HfArguments
 from hfutils.constants import TASK_TO_KEYS, TASK_TO_LABELS
 
 def label2text(task_name, label):
-    # easy_labels = ("true", "false")
-    # return easy_labels[label]
     if TASK_TO_LABELS[task_name] is None:
         return label
     else:
         return TASK_TO_LABELS[task_name][label]
-        # return easy_labels[label]
 
+def token2label(tokens, label_tokens: List):
+    return [label_tokens.index(t) for t in tokens]
 
 def get_optimizer_grouped_parameters(args, model):
     no_decay = ["bias", "LayerNorm.weight"]
@@ -94,6 +94,8 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text
 
 logger = logging.getLogger(__name__)
 
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 @dataclass
@@ -285,7 +287,7 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    tokenizer = T5Tokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         use_fast=model_args.use_fast_tokenizer,
@@ -294,7 +296,7 @@ def main():
     )
     # print(tokenizer.get_vocab())
     # model = AutoModelForSequenceClassification.from_pretrained(
-    model = T5ForConditionalGeneration.from_pretrained(
+    model = AutoModelForSequenceClassification.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
@@ -303,11 +305,10 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
-    print(model)
-
     # if tokenizer.pad_token is None:
     #     tokenizer.pad_token = tokenizer.eos_token
     #     model.config.pad_token_id = model.config.eos_token_id
+
 
     # Padding strategy
     if data_args.pad_to_max_length:
@@ -323,210 +324,159 @@ def main():
         )
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
-    def preprocess_function(examples, task_name):
-        # Tokenize the texts
-        sentence1_key = TASK_TO_KEYS[task_name][0]
-        sentence2_key = None if len(TASK_TO_KEYS[task_name]) == 1 else TASK_TO_KEYS[task_name][1]
-        sentence1_examples = examples[sentence1_key]
-        sentence2_examples = None if sentence2_key is None else examples[sentence2_key]
-        processed_examples = []
-        for i in range(len(sentence1_examples)):
-            elements = [
-                    task_name, 
-                    sentence1_key+":",
-                    sentence1_examples[i],
-                ]
-            if sentence2_examples is not None:
-                elements += [
-                    sentence2_key+":",
-                    sentence2_examples[i],
-                ]
-            processed_examples.append(" ".join(elements))
-
-        texts = (
-            (processed_examples,)
-        )
-        result = tokenizer(*texts, padding=padding, max_length=max_seq_length, truncation=True, return_tensors="np")
-
-        if "label" in examples:
-
-            labels = examples["label"]
-            labels = [label2text(task_name, label) for label in labels]
-
-            # Setup the tokenizer for targets
-            with tokenizer.as_target_tokenizer():
-                labels = tokenizer(labels, max_length=2, padding=padding, truncation=True, return_tensors="np")
-
-            # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
-            # padding in the loss.
-            if padding == "max_length":
-                labels["input_ids"] = [
-                    [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
-                ]
-
-            result["labels"] = labels["input_ids"]
-        # del result['label']
-        return result
-
-    with training_args.main_process_first(desc="dataset map pre-processing"):
-        raw_datasets = None
-        for task_key in TASK_TO_LABELS.keys():
-            dataset = load_dataset(
-                data_args.dataset_name, task_key, cache_dir=model_args.cache_dir
-            )
-            print(data_args.dataset_name, task_key, dataset)
-            dataset = dataset.map(
-                partial(preprocess_function, task_name=task_key),
-                batched=True,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on dataset",
-                remove_columns=["idx", "label"] + list(TASK_TO_KEYS[task_key])
-            )
-            # if data_args.max_eval_samples is not None and len(dataset['validation']) > data_args.max_eval_samples:
-            # dataset['validation'] = dataset['validation'].shuffle().select(range(data_args.max_eval_samples))
-            if data_args.max_train_samples is not None and len(dataset['train']) > data_args.max_train_samples:
-                
-                dataset['train'] = dataset['train'].shuffle().select(range(data_args.max_train_samples))
-
-            if raw_datasets is None:
-                raw_datasets = dataset
-            else:
-                raw_datasets['train'] = concatenate_datasets(
-                    [raw_datasets['train']] 
-                    + [dataset['train']] 
-                    * int(np.ceil(max(10000 / len(dataset['train']), 1)))
-                )
-                # raw_datasets['validation'] = concatenate_datasets([raw_datasets['validation'], dataset['validation']])
-                # raw_datasets['test'] = concatenate_datasets([raw_datasets['test'], dataset['test']])
-        print("raw_datasets", raw_datasets)
-    if training_args.do_train:
-        if "train" not in raw_datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = raw_datasets["train"].shuffle()
-        print(train_dataset)
-        # if data_args.max_train_samples is not None:
-        #     train_dataset = train_dataset.shuffle().select(range(data_args.max_train_samples))
-
-    # if training_args.do_eval:
-    #     if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
-    #         raise ValueError("--do_eval requires a validation dataset")
-    #     eval_dataset = raw_datasets["validation_matched" if data_args.task_name == "mnli" else "validation"].shuffle()
-    #     # if data_args.max_eval_samples is not None:
-    #     #     eval_dataset = eval_dataset.shuffle().select(range(data_args.max_eval_samples))
-
-    # if training_args.do_predict or data_args.task_name is not None or data_args.test_file is not None:
-    #     if "test" not in raw_datasets and "test_matched" not in raw_datasets:
-    #         raise ValueError("--do_predict requires a test dataset")
-    #     predict_dataset = raw_datasets["test_matched" if data_args.task_name == "mnli" else "test"].shuffle()
-    #     if data_args.max_predict_samples is not None:
-    #         predict_dataset = predict_dataset.shuffle().select(range(data_args.max_predict_samples))
-
-    # Log a few random samples from the training set:
-    if training_args.do_train:
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-
-    # metric = load_metric(data_args.dataset_name, data_args.task_name)
-
-    print("raw_datasets", raw_datasets)
-    print("train_dataset", train_dataset)
-    # print("eval_dataset", eval_dataset)
-  
     # Data collator will default to DataCollatorWithPadding, so we change it if we already did the padding.
     if data_args.pad_to_max_length:
         # data_collator = default_data_collator
-        data_collator = DataCollatorForSeq2Seq(tokenizer)
+        data_collator = default_data_collator
     elif training_args.fp16:
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
     else:
         data_collator = None
 
-    # Initialize our Trainer
-    # model.parallelize()
-    trainer = Seq2SeqTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        # eval_dataset=eval_dataset if training_args.do_eval else None,
-        # compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
 
-    # Training
-    if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        metrics = train_result.metrics
-        max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+    def preprocess_function(examples, task_name, label_to_id):
+        # Tokenize the texts
+        sentence1_key = TASK_TO_KEYS[task_name][0]
+        sentence2_key = None if len(TASK_TO_KEYS[task_name]) == 1 else TASK_TO_KEYS[task_name][1]
+        
+        args = (
+            (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
         )
-        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+        result = tokenizer(*args, padding=padding, max_length=max_seq_length, truncation=True)
 
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+        # Map labels to IDs (not necessary for GLUE tasks)
+        if label_to_id is not None and "label" in examples:
+        #     print(examples)
+            result["label"] = [(label_to_id[l] if l != -1 else -1) for l in examples["label"]]
+        else:
+            result["labels"] = examples["label"]
+        return result
 
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
+    all_acc = []
+    all_loss = []
+    for task_key in TASK_TO_LABELS.keys():
+        loss = nn.CrossEntropyLoss()
+        dataset = load_dataset(
+            data_args.dataset_name, task_key, cache_dir=model_args.cache_dir
+        )
 
-    # # Evaluation
-    # if training_args.do_eval:
-    #     logger.info("*** Evaluate ***")
+        # # Labels
+        # if task_key is not None:
+        #     is_regression = task_key == "stsb"
+        #     if not is_regression:
+        #         label_list = dataset["train"].features["label"].names
+        #         num_labels = len(label_list)
+        #     else:
+        #         num_labels = 1
+        # else:
+        #     # Trying to have good defaults here, don't hesitate to tweak to your needs.
+        #     is_regression = dataset["train"].features["label"].dtype in ["float32", "float64"]
+        #     if is_regression:
+        #         num_labels = 1
+        #     else:
+        #         # A useful fast method:
+        #         # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
+        #         label_list = dataset["train"].unique("label")
+        #         label_list.sort()  # Let's sort it for determinism
+        #         num_labels = len(label_list)
 
-    #     # Loop to handle MNLI double evaluation (matched, mis-matched)
-    #     tasks = [data_args.task_name]
-    #     eval_datasets = [eval_dataset]
-    #     if data_args.task_name == "mnli":
-    #         tasks.append("mnli-mm")
-    #         eval_datasets.append(raw_datasets["validation_mismatched"])
+        # num_labels = 3
 
-    #     for eval_dataset, task in zip(eval_datasets, tasks):
-    #         metrics = trainer.evaluate(eval_dataset=eval_dataset)
+        # # Some models have set the order of the labels to use, so let's make sure we do use it.
+        # label_to_id = None
+        # if (
+        #     model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
+        #     and task_key is not None
+        #     and not is_regression
+        # ):
+        #     # Some have all caps in their config, some don't.
+        #     label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
+        #     if list(sorted(label_name_to_id.keys())) == list(sorted(label_list)):
+        #         label_to_id = {i: int(label_name_to_id[label_list[i]]) for i in range(num_labels)}
+        #     else:
+        #         logger.warning(
+        #             "Your model seems to have been trained with labels, but they don't match the dataset: ",
+        #             f"model labels: {list(sorted(label_name_to_id.keys()))}, dataset labels: {list(sorted(label_list))}."
+        #             "\nIgnoring the model labels as a result.",
+        # )
 
-    #         max_eval_samples = (
-    #             data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-    #         )
-    #         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
-
-    #         trainer.log_metrics("eval", metrics)
-    #         trainer.save_metrics("eval", metrics)
-
-    # if training_args.do_predict:
-    #     logger.info("*** Predict ***")
-
-    #     # Loop to handle MNLI double evaluation (matched, mis-matched)
-    #     tasks = [data_args.task_name]
-    #     predict_datasets = [predict_dataset]
-    #     if data_args.task_name == "mnli":
-    #         tasks.append("mnli-mm")
-    #         predict_datasets.append(raw_datasets["test_mismatched"])
-
-    #     for predict_dataset, task in zip(predict_datasets, tasks):
-    #         # Removing the `label` columns because it contains -1 and Trainer won't like that.
-    #         predict_dataset = predict_dataset.remove_columns("label")
-    #         predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
-    #         predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
-
-    #         output_predict_file = os.path.join(training_args.output_dir, f"predict_results_{task}.txt")
-    #         if trainer.is_world_process_zero():
-    #             with open(output_predict_file, "w") as writer:
-    #                 logger.info(f"***** Predict results {task} *****")
-    #                 writer.write("index\tprediction\n")
-    #                 for index, item in enumerate(predictions):
-    #                     if is_regression:
-    #                         writer.write(f"{index}\t{item:3.3f}\n")
-    #                     else:
-    #                         item = label_list[item]
-    #                         writer.write(f"{index}\t{item}\n")
+        # print("label_to_id", label_to_id, is_regression)
 
 
-def _mp_fn(index):
-    # For xla_spawn (TPUs)
-    main()
+        print(data_args.dataset_name, task_key, dataset)
+        dataset = dataset.map(
+            partial(preprocess_function, task_name=task_key, label_to_id=None),
+            batched=True,
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc="Running tokenizer on dataset",
+            remove_columns=["idx", "label"] + list(TASK_TO_KEYS[task_key])
+        )
+        eval_name = "validation_matched" if task_key == "mnli" else "validation"
+        eval_dataset = dataset[eval_name]
+
+        # Log a few random samples from the training set:
+        for index in random.sample(range(len(eval_dataset)), 3):
+            logger.info(f"Sample {index} of the training set: {eval_dataset[index]}.")
+
+        metric = load_metric("accuracy")
+
+        print("eval_dataset", eval_dataset)
+    
+
+
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=64,
+            collate_fn=data_collator,
+        )
+
+        label_tokens = [
+            tokenizer(label, max_length=2).input_ids[0]
+            for label in TASK_TO_LABELS['mnli']
+            if label is not None
+        ]
+
+        model = model.to("cuda")
+
+        logits_list = []
+        labels_list = []
+        for batch in tqdm(eval_dataloader, desc=task_key):
+            input_ids = batch['input_ids'].to("cuda")
+            attention_mask = batch['attention_mask'].to("cuda")
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+            logits = outputs.logits
+            predictions = np.argmax(logits.detach().cpu(), axis=-1)
+            labels = batch['labels'].flatten()
+
+            # print(predictions, labels)
+
+            metric.add_batch(
+                predictions=predictions,
+                references=labels
+            )
+            logits_list.append(logits.detach().cpu())
+            labels_list += labels
+
+        labels = torch.Tensor(labels_list).flatten().long()
+        logits = torch.cat(logits_list, dim=0)
+
+
+        eval_result = metric.compute()
+        eval_loss = loss(logits, labels)
+
+        print(labels.shape, logits.shape)
+        print(task_key, eval_result, eval_loss)
+
+        all_acc.append(eval_result['accuracy'])
+        all_loss.append(eval_loss.item())
+    
+    import scipy.stats as stats
+    print("accuracy",stats.describe(all_acc))
+    print("loss",stats.describe(all_loss))
 
 
 if __name__ == "__main__":

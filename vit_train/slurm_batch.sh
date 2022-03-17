@@ -18,7 +18,7 @@
 #SBATCH --mail-type=ALL
 #SBATCH --gres=gpu:8
 #SBATCH --partition=big
-#SBATCH --cpus-per-task=40
+#SBATCH --cpus-per-task=20
 
 # ====================
 # Options for sbatch
@@ -59,7 +59,7 @@ source activate torch
 
 # Make script bail out after first error
 set -e
- 
+
 # ==============================
 # Finally, run the experiment!
 # ==============================
@@ -74,55 +74,9 @@ set -e
 #source /etc/profile.d/modules.sh
 #module load cuda
 
-MODULE="google/t5-large-lm-adapt"
-LR=6e-5
-TASK="mnli"
 
-echo "Job running ${MODULE}, ${LR}, ${TASK}"
-
-# TASKS=( "qqp" "qnli" "mrpc" "mnli" )
-
-# for task in "${TASKS[@]}"; do
-#    bash t5train/run_glue_no_trainer.sh ${task} ${MODULE} ${LR} ${HOME}/HuggingFace
-# done
-
-# bash t5train/run_glue_no_trainer.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
-
-# bash run_glue.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
-# bash run_glue.sh RTE gpt-neo-2.7B 2e-5 ${HOME}/HuggingFace
-# bash run_glue_no_trainer_pp.sh CoLA gpt-j-6B 2e-5 ${HOME}/HuggingFace
-# bash run_glue_no_trainer_ds.sh ${TASK} ${MODULE} ${LR} ${HOME}/HuggingFace
-
-# bash t5train/run_glue_all.sh all ${MODULE} ${LR} ${HOME}/HuggingFace
-
-base_dir=${HOME}/HuggingFace
-model_name="google/t5-small-lm-adapt"
-task_name="all-moq"
-learning_rate=6e-5
-batch_size=8
-
-mkdir -p ./outputs/${model_name}/${task_name}/
-mkdir -p ./log/${model_name}/${task_name}/
-
-deepspeed t5train/run_glue_all.py \
-    --deepspeed deepspeed_cfg_auto_stage2_moq.json \
-    --model_name_or_path ${base_dir}/${model_name} \
-    --task_name ${task_name} \
-    --dataset_name glue \
-    --max_seq_length 128 \
-    --do_train \
-    --per_device_train_batch_size ${batch_size} \
-    --learning_rate ${learning_rate} \
-    --num_train_epochs 5 \
-    --save_strategy steps \
-    --save_steps 200 \
-    --gradient_accumulation_steps 8 \
-    --warmup_steps 100 \
-    --weight_decay 0.01 \
-    --output_dir ./outputs/${model_name}/${task_name}/ \
-    &> ./log/${model_name}/${task_name}/glue_bsz${batch_size}_lr${learning_rate}.log
-
-
+cd /jmain02/home/J2AD002/jxm12/lxx22-jxm12/model-finetune
+bash huggingface-vit-finetune/run_vit.sh imagenet-moq google/vit-huge-patch14-224-in21k 3e-3 ~/HuggingFace/
 
 # =========================
 # Post experiment logging
